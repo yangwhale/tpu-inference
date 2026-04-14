@@ -4,16 +4,11 @@
 # Python package. 
 #
 # Key differences from the standard Dockerfile:
-# 1. It builds a redistributable wheel (.whl) for vllm-tpu.
-# 2. It installs the 'tpu-inference' package from a package index.
-# 3. Use this file if you are verifying the PyPI distribution flow or need 
-#    a production-ready wheel installation rather than an editable source build.
+# 1. It installs the 'vllm-tpu' package from a package index (PyPI).
+# 2. It sets up the environment to run tests against the installed package.
 # ==============================================================================
 
 ARG BASE_IMAGE="python:3.12-slim-bookworm"
-# The latest main will be used if arg unspecified
-ARG VLLM_COMMIT_HASH=""
-
 FROM $BASE_IMAGE
 
 ARG IS_TEST="false"
@@ -33,32 +28,40 @@ RUN apt-get update && apt-get install -y \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# Install tpu_inference
+# Set working directory
 WORKDIR /workspace/tpu_inference
-COPY requirements.txt .
-RUN --mount=type=cache,target=/root/.cache/pip pip install --extra-index-url https://download.pytorch.org/whl/cpu -r requirements.txt --retries 3
+
+# Install benchmarking requirements (not included in vllm-tpu package)
 COPY requirements_benchmarking.txt .
-# These are needed for the E2E benchmarking tests (i.e. tests/e2e/benchmarking/mlperf.sh)
 RUN --mount=type=cache,target=/root/.cache/pip pip install -r requirements_benchmarking.txt --retries 3
-# Install test requirements
+
+# Install test requirements (not included in vllm-tpu package)
 COPY requirements_test.txt .
-RUN  --mount=type=cache,target=/root/.cache/pip if [ "$IS_TEST" = "true" ]; then \
+RUN --mount=type=cache,target=/root/.cache/pip if [ "$IS_TEST" = "true" ]; then \
         pip install -r requirements_test.txt --retries 3; \
     fi
 
+# Copy the repository content (primarily for the tests/ directory)
 COPY . .
-# Build tpu_inference
-RUN python3 -m pip install build
-RUN python3 -m build
 
-# Build vllm-tpu wheel
-WORKDIR /workspace
-ARG VLLM_COMMIT_HASH
-RUN VLLM_TPU_VERSION=$(date -u +%Y%m%d) && \
-    bash tpu_inference/.buildkite/scripts/build_vllm_tpu.sh --local "${VLLM_TPU_VERSION}" "${VLLM_COMMIT_HASH}"
+# Clone vLLM repository purely to obtain its test scripts used by e2e/benchmarking
+# WORKDIR /workspace
+# ARG VLLM_COMMIT_HASH=""
+# RUN git clone https://github.com/vllm-project/vllm.git && \
+#     cd vllm && \
+#     if [ -n "$VLLM_COMMIT_HASH" ]; then git checkout "$VLLM_COMMIT_HASH"; fi
 
-# Install vllm-tpu wheel
-RUN pip install --no-cache-dir vllm/dist/*.whl
+# Install vLLM test dependencies required to run its test suite
+# WORKDIR /workspace/vllm
+# RUN --mount=type=cache,target=/root/.cache/pip python3 -m pip install -e tests/vllm_test_utils
+RUN --mount=type=cache,target=/root/.cache/pip python3 -m pip install \
+    git+https://github.com/thuml/depyf.git \
+    pytest-asyncio \
+    "lm-eval[api]==0.4.9.2" \
+    pytest-cov \
+    tblib
 
+# Install specific version of vllm-tpu from PyPI
+RUN pip install --no-cache-dir vllm-tpu==0.18.0rc1
 
 CMD ["/bin/bash"]
