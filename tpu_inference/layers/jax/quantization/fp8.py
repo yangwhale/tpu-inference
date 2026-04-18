@@ -65,6 +65,10 @@ FP8_QUANT_METHOD_SUPPORTED_MOE_BACKENDS = [
 _moe_requant_executor: ThreadPoolExecutor | None = None
 _moe_requant_pending: dict[str, Future] = {}
 
+# Dedicated single-thread executor for async cache writes (fire-and-forget).
+# Cache writes are side effects — they should NOT block shard_put to TPU.
+_cache_write_executor: ThreadPoolExecutor | None = None
+
 
 def _get_moe_executor() -> ThreadPoolExecutor | None:
     """Lazily create the thread pool for parallel MoE requantization."""
@@ -79,13 +83,52 @@ def _get_moe_executor() -> ThreadPoolExecutor | None:
     return _moe_requant_executor
 
 
+def _get_cache_write_executor() -> ThreadPoolExecutor:
+    """Lazily create a single-thread executor for async cache writes."""
+    global _cache_write_executor
+    if _cache_write_executor is None:
+        _cache_write_executor = ThreadPoolExecutor(
+            max_workers=2, thread_name_prefix="moe-cache-writer")
+        logger.info("[MoE cache] Created async cache writer pool")
+    return _cache_write_executor
+
+
+def _async_save_moe_cache(cache_path: str, weights: FusedMoEWeights,
+                          prefix: str) -> None:
+    """Save MoE cache asynchronously — does not block the caller."""
+
+    # Materialize JAX arrays to numpy BEFORE submitting to avoid
+    # cross-thread JAX issues. This forces lazy evaluation now.
+    save_dict = {}
+    for name in ["w13_weight", "w13_weight_scale", "w13_bias",
+                  "w2_weight", "w2_weight_scale", "w2_bias"]:
+        val = getattr(weights, name)
+        if val is not None:
+            save_dict[name] = np.asarray(val)
+            save_dict[f"{name}_dtype"] = np.array(
+                str(val.dtype), dtype=object)
+
+    def _do_write():
+        t0 = time.perf_counter()
+        try:
+            os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+            np.savez(cache_path, **save_dict)
+            elapsed = time.perf_counter() - t0
+            logger.info(
+                f"[MoE cache saved] {prefix} → {cache_path} "
+                f"({elapsed:.1f}s)")
+        except Exception as e:
+            logger.warning(f"Failed to save MoE cache for {prefix}: {e}")
+
+    _get_cache_write_executor().submit(_do_write)
+
+
 def _submit_moe_requant(
     prefix: str,
     input_weights: FusedMoEWeights,
     moe_backend: MoEBackend,
     mesh,
     activation: str,
-    cache_path: str | None,
 ) -> Future:
     """Submit a MoE requantization job to the thread pool."""
 
@@ -102,16 +145,6 @@ def _submit_moe_requant(
         elapsed = time.perf_counter() - t0
         logger.info(
             f"[MoE parallel] {prefix} requantized in {elapsed:.1f}s")
-
-        # Save to cache if configured
-        if cache_path:
-            try:
-                _save_moe_cache(cache_path, weights)
-                logger.info(f"[MoE cache saved] {prefix} → {cache_path}")
-            except Exception as e:
-                logger.warning(
-                    f"Failed to save MoE cache for {prefix}: {e}")
-
         return weights
 
     executor = _get_moe_executor()
@@ -691,7 +724,7 @@ class Fp8FusedMoEMethod(QuantizeMethodBase):
                         f"requant job")
                     future = _submit_moe_requant(
                         layer.prefix, input_weights, layer.moe_backend,
-                        layer.mesh, layer.activation, cache_path)
+                        layer.mesh, layer.activation)
                     weights = future.result()  # Block until done
                     _moe_requant_pending.pop(layer.prefix, None)
                 else:
@@ -709,17 +742,14 @@ class Fp8FusedMoEMethod(QuantizeMethodBase):
                             weight_block_size=None,
                         )
 
-                    # Save to cache for next startup
-                    if cache_path:
-                        try:
-                            _save_moe_cache(cache_path, weights)
-                            logger.info(
-                                f"[MoE cache saved] {layer.prefix} "
-                                f"→ {cache_path}")
-                        except Exception as e:
-                            logger.warning(
-                                f"Failed to save MoE cache for "
-                                f"{layer.prefix}: {e}")
+                # Save cache asynchronously — fire and forget.
+                # np.asarray() materializes JAX lazy arrays now (in
+                # the calling thread), then the actual disk write
+                # happens in a background thread without blocking
+                # shard_put to TPU.
+                if cache_path:
+                    _async_save_moe_cache(
+                        cache_path, weights, layer.prefix)
 
             # Replace intermediate per-expert params with processed weights
             del layer.kernel_gating_EDF
