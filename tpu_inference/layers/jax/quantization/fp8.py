@@ -14,15 +14,20 @@
 
 import functools
 import math
+import os
+import time
+from concurrent.futures import Future, ThreadPoolExecutor
 from functools import partial
 from typing import Iterable, Optional, Tuple
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import torch
 from flax import nnx
 from jax.sharding import PartitionSpec as P
 
+import tpu_inference.envs as envs
 from tpu_inference.layers.common.linear import sharded_quantized_batched_matmul
 from tpu_inference.layers.common.moe import MoEBackend, moe_apply
 from tpu_inference.layers.common.process_weights.linear_weights import \
@@ -52,6 +57,114 @@ logger = init_logger(__name__)
 FP8_QUANT_METHOD_SUPPORTED_MOE_BACKENDS = [
     MoEBackend.GMM_EP, MoEBackend.GMM_TP
 ]
+
+# --- Parallel MoE requantization ---
+# Shared executor for parallel requantization across MoE layers.
+# When MOE_PARALLEL_WORKERS > 1, requant jobs are submitted to this pool
+# and processed concurrently while weight loading continues.
+_moe_requant_executor: ThreadPoolExecutor | None = None
+_moe_requant_pending: dict[str, Future] = {}
+
+
+def _get_moe_executor() -> ThreadPoolExecutor | None:
+    """Lazily create the thread pool for parallel MoE requantization."""
+    global _moe_requant_executor
+    num_workers = envs.MOE_PARALLEL_WORKERS
+    if num_workers <= 1:
+        return None
+    if _moe_requant_executor is None:
+        _moe_requant_executor = ThreadPoolExecutor(max_workers=num_workers)
+        logger.info(
+            f"[MoE parallel] Created thread pool with {num_workers} workers")
+    return _moe_requant_executor
+
+
+def _submit_moe_requant(
+    prefix: str,
+    input_weights: FusedMoEWeights,
+    moe_backend: MoEBackend,
+    mesh,
+    activation: str,
+    cache_path: str | None,
+) -> Future:
+    """Submit a MoE requantization job to the thread pool."""
+
+    def _do_requant():
+        t0 = time.perf_counter()
+        with cpu_mesh_context():
+            weights = process_fp8_moe_weights(
+                input_weights,
+                moe_backend=moe_backend,
+                mesh=mesh,
+                activation=activation,
+                weight_block_size=None,
+            )
+        elapsed = time.perf_counter() - t0
+        logger.info(
+            f"[MoE parallel] {prefix} requantized in {elapsed:.1f}s")
+
+        # Save to cache if configured
+        if cache_path:
+            try:
+                _save_moe_cache(cache_path, weights)
+                logger.info(f"[MoE cache saved] {prefix} → {cache_path}")
+            except Exception as e:
+                logger.warning(
+                    f"Failed to save MoE cache for {prefix}: {e}")
+
+        return weights
+
+    executor = _get_moe_executor()
+    future = executor.submit(_do_requant)
+    _moe_requant_pending[prefix] = future
+    logger.info(
+        f"[MoE parallel] Submitted {prefix} "
+        f"({len(_moe_requant_pending)} jobs in flight)")
+    return future
+
+
+# --- Weight cache ---
+
+
+def _get_moe_cache_path(cache_dir: str, layer_prefix: str) -> str:
+    """Get the cache file path for a MoE layer's processed weights."""
+    safe_name = layer_prefix.replace(".", "_").replace("/", "_")
+    return os.path.join(cache_dir, f"{safe_name}.npz")
+
+
+def _save_moe_cache(cache_path: str, weights: FusedMoEWeights) -> None:
+    """Save processed MoE weights to disk as .npz."""
+    os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+    save_dict = {}
+    for name in ["w13_weight", "w13_weight_scale", "w13_bias",
+                  "w2_weight", "w2_weight_scale", "w2_bias"]:
+        val = getattr(weights, name)
+        if val is not None:
+            save_dict[name] = np.asarray(val)
+            save_dict[f"{name}_dtype"] = np.array(
+                str(val.dtype), dtype=object)
+    np.savez(cache_path, **save_dict)
+
+
+def _load_moe_cache(cache_path: str) -> FusedMoEWeights | None:
+    """Load processed MoE weights from cache. Returns None if not found."""
+    if not os.path.exists(cache_path):
+        return None
+    try:
+        data = np.load(cache_path, allow_pickle=True)
+        fields = {}
+        for name in ["w13_weight", "w13_weight_scale", "w13_bias",
+                      "w2_weight", "w2_weight_scale", "w2_bias"]:
+            if name in data:
+                dtype_str = str(data[f"{name}_dtype"])
+                jax_dtype = jnp.dtype(dtype_str)
+                fields[name] = jnp.array(data[name], dtype=jax_dtype)
+            else:
+                fields[name] = None
+        return FusedMoEWeights(**fields)
+    except Exception as e:
+        logger.warning(f"Failed to load MoE cache from {cache_path}: {e}")
+        return None
 
 
 def load_fp8_weight(jax_param: nnx.Param, torch_weight: torch.Tensor,
@@ -477,6 +590,21 @@ class Fp8FusedMoEMethod(QuantizeMethodBase):
         Please see https://github.com/vllm-project/tpu-inference/blob/bb1a88/tpu_inference/layers/common/moe.py#L39
         for more information on the expected weights per MoE backend.
 
+        Supports two optimizations controlled by environment variables:
+
+        1. **Parallel requantization** (MOE_PARALLEL_WORKERS > 1):
+           Multiple MoE layers are requantized concurrently via a shared
+           ThreadPoolExecutor. This leverages the fact that load_hf_weights
+           already uses multi-threaded file loading — each file-loading
+           thread submits its layer's requant to the shared pool and
+           block-waits for the result, allowing up to MOE_PARALLEL_WORKERS
+           layers to be processed simultaneously.
+
+        2. **Weight caching** (MOE_WEIGHT_CACHE_DIR set):
+           Processed FP4 weights are saved to disk after the first
+           requantization. On subsequent startups, cached weights are
+           loaded directly, skipping the expensive CPU requantization.
+
         Args:
             layer: The layer to process.
         """
@@ -495,57 +623,112 @@ class Fp8FusedMoEMethod(QuantizeMethodBase):
                     getattr(layer, down_scale_name), layer.kernel_gating_EDF,
                     layer.kernel_up_proj_EDF, layer.kernel_down_proj_EFD
                 ]):
-                # If weights for a module is spread across multiple files, this function may be called
-                # more than once. We only want to process the weights once all of them are loaded.
+                # If weights for a module is spread across multiple files,
+                # this function may be called more than once. We only want
+                # to process the weights once all of them are loaded.
                 return False
 
-            with cpu_mesh_context():
-                w_gate = jnp.concatenate(
-                    layer.kernel_gating_EDF._weights_to_load, axis=0)
-                w_up = jnp.concatenate(
-                    layer.kernel_up_proj_EDF._weights_to_load, axis=0)
-                s_gate = jnp.concatenate(getattr(
-                    layer, gating_scale_name)._weights_to_load,
-                                         axis=0)
-                s_up = jnp.concatenate(getattr(layer,
-                                               up_scale_name)._weights_to_load,
-                                       axis=0)
-                w2_weight = jnp.concatenate(
-                    layer.kernel_down_proj_EFD._weights_to_load, axis=0)
-                w2_weight_scale = jnp.concatenate(getattr(
-                    layer, down_scale_name)._weights_to_load,
-                                                  axis=0)
+            # Check if we can load from cache
+            cache_dir = envs.MOE_WEIGHT_CACHE_DIR
+            cache_path = (_get_moe_cache_path(cache_dir, layer.prefix)
+                          if cache_dir else None)
+            cached_weights = (_load_moe_cache(cache_path)
+                              if cache_path else None)
 
-                # Fuse the weights into w13: [Gate, Up]. w2 is expected to be
-                # (num_experts, hidden_size, intermediate_size), w13 is expected to
-                # be (num_experts, 2 * intermediate_size, hidden_size,)
-                w13_weight = jnp.concatenate([w_gate, w_up], axis=1)
-                w13_weight_scale = jnp.concatenate([s_gate, s_up], axis=1)
+            t0 = time.perf_counter()
 
-                # TODO (jacobplatin): we should support bias
-                input_weights = FusedMoEWeights(
-                    w13_weight=w13_weight,
-                    w13_weight_scale=w13_weight_scale,
-                    w13_bias=None,
-                    w2_weight=w2_weight,
-                    w2_weight_scale=w2_weight_scale,
-                    w2_bias=None)
+            if cached_weights is not None:
+                logger.info(
+                    f"[MoE cache hit] Loading pre-processed weights for "
+                    f"{layer.prefix} from {cache_path}")
+                weights = cached_weights
+            else:
+                # Prepare fused input weights from per-expert tensors
+                with cpu_mesh_context():
+                    w_gate = jnp.concatenate(
+                        layer.kernel_gating_EDF._weights_to_load, axis=0)
+                    w_up = jnp.concatenate(
+                        layer.kernel_up_proj_EDF._weights_to_load, axis=0)
+                    s_gate = jnp.concatenate(getattr(
+                        layer, gating_scale_name)._weights_to_load,
+                                             axis=0)
+                    s_up = jnp.concatenate(getattr(
+                        layer, up_scale_name)._weights_to_load,
+                                           axis=0)
+                    w2_weight = jnp.concatenate(
+                        layer.kernel_down_proj_EFD._weights_to_load, axis=0)
+                    w2_weight_scale = jnp.concatenate(getattr(
+                        layer, down_scale_name)._weights_to_load,
+                                                      axis=0)
 
-                weights = process_fp8_moe_weights(
-                    input_weights,
-                    moe_backend=layer.moe_backend,
-                    mesh=layer.mesh,
-                    activation=layer.activation,
-                    # Source block size should be inferred from scale shape
-                    weight_block_size=None,
-                )
+                    # Fuse the weights into w13: [Gate, Up]. w2 is expected
+                    # to be (num_experts, hidden_size, intermediate_size),
+                    # w13 is expected to be
+                    # (num_experts, 2 * intermediate_size, hidden_size)
+                    w13_weight = jnp.concatenate([w_gate, w_up], axis=1)
+                    w13_weight_scale = jnp.concatenate(
+                        [s_gate, s_up], axis=1)
 
+                    # TODO (jacobplatin): we should support bias
+                    input_weights = FusedMoEWeights(
+                        w13_weight=w13_weight,
+                        w13_weight_scale=w13_weight_scale,
+                        w13_bias=None,
+                        w2_weight=w2_weight,
+                        w2_weight_scale=w2_weight_scale,
+                        w2_bias=None)
+
+                # Requantize: parallel or serial
+                executor = _get_moe_executor()
+                if executor is not None:
+                    # Parallel path: submit to shared pool and block-wait.
+                    # The file-loading ThreadPoolExecutor (up to 64 threads)
+                    # may call this method for many layers concurrently.
+                    # Each thread submits its requant job here; the shared
+                    # pool runs up to MOE_PARALLEL_WORKERS at a time.
+                    logger.info(
+                        f"[MoE parallel] {layer.prefix} — submitting "
+                        f"requant job")
+                    future = _submit_moe_requant(
+                        layer.prefix, input_weights, layer.moe_backend,
+                        layer.mesh, layer.activation, cache_path)
+                    weights = future.result()  # Block until done
+                    _moe_requant_pending.pop(layer.prefix, None)
+                else:
+                    # Serial path: process in current thread
+                    if cache_dir:
+                        logger.info(
+                            f"[MoE cache miss] {layer.prefix} — "
+                            f"requantizing (serial)")
+                    with cpu_mesh_context():
+                        weights = process_fp8_moe_weights(
+                            input_weights,
+                            moe_backend=layer.moe_backend,
+                            mesh=layer.mesh,
+                            activation=layer.activation,
+                            weight_block_size=None,
+                        )
+
+                    # Save to cache for next startup
+                    if cache_path:
+                        try:
+                            _save_moe_cache(cache_path, weights)
+                            logger.info(
+                                f"[MoE cache saved] {layer.prefix} "
+                                f"→ {cache_path}")
+                        except Exception as e:
+                            logger.warning(
+                                f"Failed to save MoE cache for "
+                                f"{layer.prefix}: {e}")
+
+            # Replace intermediate per-expert params with processed weights
             del layer.kernel_gating_EDF
             del layer.kernel_up_proj_EDF
             delattr(layer, gating_scale_name)
             delattr(layer, up_scale_name)
 
-            # TODO (jacobplatin): we probably want to make the sharding configurable
+            # TODO (jacobplatin): we probably want to make the sharding
+            # configurable
             layer.kernel_gating_upproj_EDF = nnx.Param(
                 shard_put(weights.w13_weight, shardings=layer.edf_sharding))
             layer.kernel_down_proj_EFD = nnx.Param(
@@ -553,9 +736,11 @@ class Fp8FusedMoEMethod(QuantizeMethodBase):
             # gmm expects shape [num_groups, num_blocks, 1, n]
             # TODO(gpolovets1): Make sure it works for gmm_v2 as well.
             edf_scale_sharding = (layer.edf_sharding[0], ) + (None, ) * (
-                weights.w13_weight_scale.ndim - 2) + (layer.edf_sharding[-1], )
+                weights.w13_weight_scale.ndim - 2) + (
+                    layer.edf_sharding[-1], )
             efd_scale_sharding = (layer.efd_sharding[0], ) + (None, ) * (
-                weights.w2_weight_scale.ndim - 2) + (layer.efd_sharding[-1], )
+                weights.w2_weight_scale.ndim - 2) + (
+                    layer.efd_sharding[-1], )
             setattr(
                 layer, f"kernel_gating_upproj_EDF_{self.weight_scale_name}",
                 nnx.Param(
@@ -566,10 +751,17 @@ class Fp8FusedMoEMethod(QuantizeMethodBase):
                 nnx.Param(
                     shard_put(weights.w2_weight_scale,
                               shardings=efd_scale_sharding)))
+
+            elapsed = time.perf_counter() - t0
+            label = "cached" if cached_weights else "requantized"
+            logger.info(
+                f"[MoE weights] {layer.prefix} processed in {elapsed:.1f}s"
+                f" ({label})")
         else:
             raise NotImplementedError(
-                f"Unsupported moe backend: {layer.moe_backend}! Currently supported: {FP8_QUANT_METHOD_SUPPORTED_MOE_BACKENDS}"
-            )
+                f"Unsupported moe backend: {layer.moe_backend}! "
+                f"Currently supported: "
+                f"{FP8_QUANT_METHOD_SUPPORTED_MOE_BACKENDS}")
 
         return True
 
