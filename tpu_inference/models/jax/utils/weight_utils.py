@@ -969,8 +969,13 @@ def _load_moe_from_cache(model: "nnx.Module") -> None:
         success = qm.process_weights_after_loading(module)
         if success:
             loaded += 1
-            jax.clear_caches()
+            # Clear XLA compilation caches periodically to prevent HBM OOM.
+            # The cached path mostly uses eager ops (make_array_from_callback)
+            # but astype(float4) produces a small compilation each time.
+            if loaded % 10 == 0:
+                jax.clear_caches()
     if loaded:
+        jax.clear_caches()  # Final cleanup
         logger.info("[MoE cache] Loaded %d MoE layers from cache", loaded)
 
 

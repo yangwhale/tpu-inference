@@ -122,11 +122,10 @@ def _start_moe_prefetch(cache_dir: str) -> None:
             return
         _moe_prefetch_started = True
 
-    # TEMPORARILY DISABLED for debugging — test FP8 cache without prefetch
-    logger.info("[MoE prefetch] DISABLED for debugging, using direct load")
-    return
-
-    cache_files = sorted(glob.glob(os.path.join(cache_dir, "*.npz")))
+    # Use config subdir if available, otherwise scan cache_dir directly.
+    scan_dir = (os.path.join(cache_dir, _config_subdir_cache)
+                if _config_subdir_cache else cache_dir)
+    cache_files = sorted(glob.glob(os.path.join(scan_dir, "*.npz")))
     if not cache_files:
         return
 
