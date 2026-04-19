@@ -966,6 +966,14 @@ def _load_moe_from_cache(model: "nnx.Module") -> None:
             continue
         if not hasattr(qm, "process_weights_after_loading"):
             continue
+        # Only process MoE expert modules (SharedFusedMoe), skip routers.
+        # Routers are JaxMoE subclasses but don't have expert weights.
+        if not hasattr(module, 'kernel_gating_EDF'):
+            logger.debug("[MoE cache] Skipping non-expert JaxMoE: %s (%s)",
+                         path, type(module).__name__)
+            continue
+        logger.info("[MoE cache] Processing %s (%s)", path,
+                    type(module).__name__)
         success = qm.process_weights_after_loading(module)
         if success:
             loaded += 1

@@ -16,6 +16,7 @@ import functools
 import glob
 import math
 import os
+import re
 import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -125,7 +126,17 @@ def _start_moe_prefetch(cache_dir: str) -> None:
     # Use config subdir if available, otherwise scan cache_dir directly.
     scan_dir = (os.path.join(cache_dir, _config_subdir_cache)
                 if _config_subdir_cache else cache_dir)
-    cache_files = sorted(glob.glob(os.path.join(scan_dir, "*.npz")))
+    # Sort numerically by layer index so prefetch order matches
+    # iter_modules() traversal order (layer 3, 4, 5, ...).
+    # Alphabetical sort puts "layers_10" before "layers_3", causing
+    # deadlock: semaphore slots fill with layers the consumer hasn't
+    # reached yet, blocking the layer it actually needs.
+    def _layer_sort_key(path):
+        m = re.search(r'layers_(\d+)', os.path.basename(path))
+        return int(m.group(1)) if m else 0
+
+    cache_files = sorted(glob.glob(os.path.join(scan_dir, "*.npz")),
+                         key=_layer_sort_key)
     if not cache_files:
         return
 
