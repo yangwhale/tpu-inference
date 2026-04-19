@@ -15,6 +15,7 @@
 
 import functools
 import glob
+import json
 import math
 import os
 import re
@@ -163,6 +164,39 @@ def get_model_weights_files(
 
     weights_files.sort()
     return weights_files
+
+
+def _filter_moe_shards(model_path: str,
+                        weights_files: list[str]) -> list[str]:
+    """Skip safetensors shards that only contain MoE expert keys.
+
+    When MoE weight cache is active, expert weights are loaded from .npz
+    cache files instead of safetensors.  This function reads the safetensors
+    index to identify shards where every key matches ``mlp.experts`` and
+    removes them from the loading list, avoiding wasteful I/O.
+    """
+    index_path = os.path.join(model_path, "model.safetensors.index.json")
+    if not os.path.exists(index_path):
+        return weights_files
+
+    with open(index_path) as f:
+        index = json.load(f)
+
+    shard_has_non_moe = set()
+    for key, shard in index["weight_map"].items():
+        if "mlp.experts" not in key:
+            shard_has_non_moe.add(shard)
+
+    original_count = len(weights_files)
+    filtered = [
+        f for f in weights_files
+        if os.path.basename(f) in shard_has_non_moe
+    ]
+    skipped = original_count - len(filtered)
+    if skipped > 0:
+        logger.info("[MoE cache filter] Skipped %d/%d pure-MoE shards",
+                    skipped, original_count)
+    return filtered
 
 
 def model_weights_single_file_generator(
@@ -559,6 +593,15 @@ def load_hf_weights(
             model_path = vllm_config.model_config.model
         weights_files = get_model_weights_files(
             model_path, vllm_config.load_config.download_dir)
+        # When MoE cache is active, skip pure-MoE shards and filter
+        # MoE keys from mixed shards to avoid redundant I/O.
+        if envs.MOE_WEIGHT_CACHE_DIR:
+            weights_files = _filter_moe_shards(model_path, weights_files)
+            moe_exclude = r"^(?!.*mlp\.experts).*$"
+            if filter_regex:
+                filter_regex = f"(?={filter_regex})({moe_exclude})"
+            else:
+                filter_regex = moe_exclude
         max_workers = min(64, len(weights_files))
         # NOTE(xiang): Disable multi-threading mode if running on multi-host.
         # Because multi-threading would cause different JAX processes to load
@@ -904,6 +947,101 @@ class JaxAutoWeightsLoader(AutoWeightsLoader):
                 base_prefix] = loaded
 
 
+def _load_moe_from_cache(model: "nnx.Module") -> None:
+    """Explicitly trigger MoE cache loading for all MoE layers.
+
+    When expert weights are filtered from the safetensors iterator,
+    JaxAutoWeightsLoader never visits expert sub-modules and
+    process_weights_after_loading is never called.  This function
+    walks the model tree, finds MoE modules with a quant_method,
+    and calls process_weights_after_loading directly.
+    """
+    from tpu_inference.layers.jax.moe.moe import JaxMoE
+    loaded = 0
+    for path, module in model.iter_modules():
+        if not isinstance(module, JaxMoE):
+            continue
+        qm = getattr(module, "quant_method", None)
+        if qm is None:
+            continue
+        if not hasattr(qm, "process_weights_after_loading"):
+            continue
+        success = qm.process_weights_after_loading(module)
+        if success:
+            loaded += 1
+            jax.clear_caches()
+    if loaded:
+        logger.info("[MoE cache] Loaded %d MoE layers from cache", loaded)
+
+
+def _moe_cache_weight_filter(
+    weights: Iterable[tuple[str, torch.Tensor]],
+) -> Generator[tuple[str, torch.Tensor], None, None]:
+    """Filter out MoE expert weights when MoE cache is active.
+
+    When MOE_WEIGHT_CACHE_DIR is set, expert weights are loaded from
+    pre-quantized .npz cache files instead of safetensors.  This
+    generator skips ``mlp.experts`` keys so the upstream iterator can
+    avoid reading them from disk (safetensors reads are lazy per-key).
+    """
+    skipped = 0
+    for name, tensor in weights:
+        if "mlp.experts" in name:
+            skipped += 1
+            continue
+        yield name, tensor
+    if skipped:
+        logger.info("[MoE cache filter] Skipped %d expert weight keys "
+                    "from safetensors", skipped)
+
+
+def _filtered_safetensors_iterator(
+    model_path: str,
+) -> Generator[tuple[str, torch.Tensor], None, None]:
+    """Create a safetensors iterator that skips MoE expert weights.
+
+    Two-level filtering for maximum I/O savings:
+    1. Skip entire shards that only contain MoE expert keys (shard-level)
+    2. Skip MoE keys BEFORE reading tensor data (key-level)
+
+    This replaces the default vLLM safetensors_weights_iterator when
+    MoE cache is active, avoiding the problem where the default iterator
+    reads tensor data before yielding (making post-hoc filtering useless
+    for I/O reduction).
+    """
+    from tqdm import tqdm
+
+    # Get all safetensors files
+    weights_files = sorted(glob.glob(os.path.join(model_path,
+                                                   "*.safetensors")))
+    original_count = len(weights_files)
+
+    # Level 1: Skip pure-MoE shards entirely
+    weights_files = _filter_moe_shards(model_path, weights_files)
+    logger.info(
+        "[MoE cache] Loading %d/%d safetensors shards "
+        "(skipped %d pure-MoE)",
+        len(weights_files), original_count,
+        original_count - len(weights_files))
+
+    skipped_keys = 0
+    loaded_keys = 0
+    for st_file in tqdm(weights_files,
+                        desc="Loading safetensors (MoE-filtered)"):
+        with safe_open(st_file, framework="pt") as f:
+            for name in f.keys():
+                # Level 2: Skip MoE keys before reading tensor data
+                if "mlp.experts" in name:
+                    skipped_keys += 1
+                    continue
+                param = f.get_tensor(name)
+                loaded_keys += 1
+                yield name, param
+
+    logger.info("[MoE cache filter] Loaded %d keys, skipped %d expert keys",
+                loaded_keys, skipped_keys)
+
+
 class LoadableWithIterator:
     """Mixin for models that support loading weights with an iterator.
 
@@ -916,11 +1054,25 @@ class LoadableWithIterator:
             # Use next parent class in MRO.
             return super().load_weights(weights)
 
+        # When MoE cache is active, skip expert weights from safetensors
+        # since they will be loaded from pre-quantized .npz cache files.
+        if envs.MOE_WEIGHT_CACHE_DIR:
+            weights = _moe_cache_weight_filter(weights)
+
         loader = JaxAutoWeightsLoader(
             self,
             skip_prefixes=(["lm_head"]
                            if not hasattr(self, 'lm_head') else None))
-        return loader.load_weights(weights)
+        result = loader.load_weights(weights)
+
+        # When MoE cache is active, expert weights were filtered out of
+        # the safetensors iterator.  The JaxAutoWeightsLoader never visits
+        # expert sub-modules, so process_weights_after_loading (which
+        # loads from cache) is never called.  Trigger it explicitly here.
+        if envs.MOE_WEIGHT_CACHE_DIR:
+            _load_moe_from_cache(self)
+
+        return result
 
 
 @register_model_loader("jax_dummy")

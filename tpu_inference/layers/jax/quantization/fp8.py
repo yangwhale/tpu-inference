@@ -13,8 +13,10 @@
 # limitations under the License.
 
 import functools
+import glob
 import math
 import os
+import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from functools import partial
@@ -69,6 +71,18 @@ _moe_requant_pending: dict[str, Future] = {}
 # Cache writes are side effects — they should NOT block shard_put to TPU.
 _cache_write_executor: ThreadPoolExecutor | None = None
 
+# --- Parallel MoE cache prefetch ---
+# Reads cache files from Lustre in parallel before they're needed.
+# A semaphore bounds how many loaded results stay in memory at once
+# (each result is ~22.5 GB float16), preventing OOM.
+_MOE_PREFETCH_WORKERS = 8   # Parallel Lustre I/O threads
+_MOE_PREFETCH_AHEAD = 8     # Max loaded results in memory (~180 GB)
+_moe_prefetch_lock = threading.Lock()
+_moe_prefetch_started = False
+_moe_prefetch_executor: ThreadPoolExecutor | None = None
+_moe_prefetch_sem: threading.Semaphore | None = None
+_moe_cache_prefetch: dict[str, Future] = {}  # cache_path → Future
+
 
 def _get_moe_executor() -> ThreadPoolExecutor | None:
     """Lazily create the thread pool for parallel MoE requantization."""
@@ -93,20 +107,93 @@ def _get_cache_write_executor() -> ThreadPoolExecutor:
     return _cache_write_executor
 
 
+def _start_moe_prefetch(cache_dir: str) -> None:
+    """Scan cache directory and submit parallel reads for all cache files.
+
+    Called once on the first MoE cache hit.  Uses a semaphore to bound
+    how many loaded results can sit in memory at the same time (each
+    result ≈ 11 GB for DeepSeek-R1 FP8).  When a consumer calls
+    ``_get_prefetched_cache()``, it releases the semaphore, allowing
+    the next reader thread to start.
+    """
+    global _moe_prefetch_started, _moe_prefetch_executor, _moe_prefetch_sem
+    with _moe_prefetch_lock:
+        if _moe_prefetch_started:
+            return
+        _moe_prefetch_started = True
+
+    # TEMPORARILY DISABLED for debugging — test FP8 cache without prefetch
+    logger.info("[MoE prefetch] DISABLED for debugging, using direct load")
+    return
+
+    cache_files = sorted(glob.glob(os.path.join(cache_dir, "*.npz")))
+    if not cache_files:
+        return
+
+    _moe_prefetch_sem = threading.Semaphore(_MOE_PREFETCH_AHEAD)
+    _moe_prefetch_executor = ThreadPoolExecutor(
+        max_workers=_MOE_PREFETCH_WORKERS,
+        thread_name_prefix="moe-prefetch")
+
+    for path in cache_files:
+        future = _moe_prefetch_executor.submit(_prefetch_one_cache, path)
+        _moe_cache_prefetch[path] = future
+
+    logger.info(
+        f"[MoE prefetch] Queued {len(cache_files)} cache files, "
+        f"{_MOE_PREFETCH_WORKERS} workers, "
+        f"max {_MOE_PREFETCH_AHEAD} ahead")
+
+
+def _prefetch_one_cache(cache_path: str):
+    """Load one cache file, respecting the memory semaphore."""
+    _moe_prefetch_sem.acquire()
+    t0 = time.perf_counter()
+    result = _load_moe_cache(cache_path)
+    elapsed = time.perf_counter() - t0
+    fname = os.path.basename(cache_path)
+    logger.info(f"[MoE prefetch] {fname} ready in {elapsed:.1f}s")
+    return result
+
+
+def _get_prefetched_cache(cache_path: str):
+    """Get prefetched cache data, blocking until ready.  Returns None
+    if the file was not queued or loading failed."""
+    future = _moe_cache_prefetch.get(cache_path)
+    if future is None:
+        return None
+    try:
+        result = future.result()
+    except Exception as e:
+        logger.warning(f"[MoE prefetch] Failed for {cache_path}: {e}")
+        result = None
+    if _moe_prefetch_sem is not None:
+        _moe_prefetch_sem.release()
+    return result
+
+
 def _async_save_moe_cache(cache_path: str, weights: FusedMoEWeights,
                           prefix: str) -> None:
     """Save MoE cache asynchronously — does not block the caller."""
 
     # Materialize JAX arrays to numpy BEFORE submitting to avoid
     # cross-thread JAX issues. This forces lazy evaluation now.
-    save_dict = {}
+    # Store float4 weights as float8 — same size (1 byte/element),
+    # but JAX can ingest float8 directly (unlike float4 which has
+    # incompatible packing between numpy and XLA).
+    import ml_dtypes
+    save_dict = {"_cache_format": np.array("fp8", dtype=object)}
     for name in ["w13_weight", "w13_weight_scale", "w13_bias",
                   "w2_weight", "w2_weight_scale", "w2_bias"]:
         val = getattr(weights, name)
         if val is not None:
-            save_dict[name] = np.asarray(val)
+            np_val = np.asarray(val)
+            original_dtype = str(val.dtype)
+            if 'float4' in original_dtype:
+                np_val = np_val.astype(ml_dtypes.float8_e4m3fn)
+            save_dict[name] = np_val
             save_dict[f"{name}_dtype"] = np.array(
-                str(val.dtype), dtype=object)
+                original_dtype, dtype=object)
 
     def _do_write():
         t0 = time.perf_counter()
@@ -159,42 +246,167 @@ def _submit_moe_requant(
 # --- Weight cache ---
 
 
-def _get_moe_cache_path(cache_dir: str, layer_prefix: str) -> str:
-    """Get the cache file path for a MoE layer's processed weights."""
+def _get_config_cache_subdir(
+    moe_backend: "MoEBackend",
+    mesh: "Mesh",
+) -> str:
+    """Build a config-specific subdirectory name encoding all parameters
+    that affect the MoE cache content.
+
+    Cache content depends on: EP size, TP size, MoE backend, target
+    quantization dtype, and requantization block size.  Encoding these
+    into the path ensures that caches from different configurations
+    never collide.
+
+    Example: ``ep8_tp1_gmm_fp4e2m1_bsNone``
+    """
+    from tpu_inference.layers.common.sharding import ShardingAxisName
+    from tpu_inference.utils import get_mesh_shape_product
+
+    # EP = product of expert-parallel mesh axes
+    ep = get_mesh_shape_product(mesh, ShardingAxisName.MLP_TENSOR)
+    # TP = product of tensor-parallel mesh axes (may be 1)
+    try:
+        tp = get_mesh_shape_product(mesh, ShardingAxisName.MODEL)
+    except Exception:
+        tp = 1
+
+    backend = str(moe_backend).rsplit(".", 1)[-1].lower()
+
+    dtype_str = envs.MOE_REQUANTIZE_WEIGHT_DTYPE or "fp8"
+    dtype_short = (dtype_str
+                   .replace("float4_e2m1fn", "fp4e2m1")
+                   .replace("float8_e4m3fn", "fp8e4m3")
+                   .replace("float8_e5m2", "fp8e5m2"))
+
+    bs = envs.MOE_REQUANTIZE_BLOCK_SIZE or "None"
+
+    return f"ep{ep}_tp{tp}_{backend}_{dtype_short}_bs{bs}"
+
+
+# Module-level cache so the subdir string is computed only once.
+_config_subdir_cache: str | None = None
+
+
+def _get_moe_cache_path(
+    cache_dir: str,
+    layer_prefix: str,
+    moe_backend: "MoEBackend | None" = None,
+    mesh: "Mesh | None" = None,
+) -> str:
+    """Get the cache file path for a MoE layer's processed weights.
+
+    When *moe_backend* and *mesh* are provided (first call), computes
+    a config-specific subdirectory and caches it for subsequent calls.
+    """
+    global _config_subdir_cache
+    if _config_subdir_cache is None and moe_backend is not None and mesh is not None:
+        _config_subdir_cache = _get_config_cache_subdir(moe_backend, mesh)
+        logger.info("[MoE cache] Config subdir: %s", _config_subdir_cache)
+
     safe_name = layer_prefix.replace(".", "_").replace("/", "_")
+
+    if _config_subdir_cache:
+        return os.path.join(cache_dir, _config_subdir_cache,
+                            f"{safe_name}.npz")
+
     return os.path.join(cache_dir, f"{safe_name}.npz")
 
 
 def _save_moe_cache(cache_path: str, weights: FusedMoEWeights) -> None:
-    """Save processed MoE weights to disk as .npz."""
+    """Save processed MoE weights to disk as .npz.
+
+    Float4 weights are stored as float8_e4m3fn — same byte size but
+    JAX-compatible (no numpy↔XLA packing mismatch).
+    """
+    import ml_dtypes
     os.makedirs(os.path.dirname(cache_path), exist_ok=True)
-    save_dict = {}
+    save_dict = {"_cache_format": np.array("fp8", dtype=object)}
     for name in ["w13_weight", "w13_weight_scale", "w13_bias",
                   "w2_weight", "w2_weight_scale", "w2_bias"]:
         val = getattr(weights, name)
         if val is not None:
-            save_dict[name] = np.asarray(val)
+            np_val = np.asarray(val)
+            original_dtype = str(val.dtype)
+            if 'float4' in original_dtype:
+                np_val = np_val.astype(ml_dtypes.float8_e4m3fn)
+            save_dict[name] = np_val
             save_dict[f"{name}_dtype"] = np.array(
-                str(val.dtype), dtype=object)
+                original_dtype, dtype=object)
     np.savez(cache_path, **save_dict)
 
 
-def _load_moe_cache(cache_path: str) -> FusedMoEWeights | None:
-    """Load processed MoE weights from cache. Returns None if not found."""
+def _load_moe_cache(
+    cache_path: str,
+) -> dict[str, np.ndarray | str | None] | None:
+    """Load processed MoE weights from cache as numpy arrays.
+
+    Returns a dict with numpy arrays and their target JAX dtypes.
+    The caller handles host→device transfer via jax.make_array_from_callback
+    so each TPU device only receives its shard (avoids int32 element limit
+    and eliminates the slow chunked jnp.array() loop).
+    """
     if not os.path.exists(cache_path):
         return None
     try:
+        import ml_dtypes
+        t_open = time.perf_counter()
         data = np.load(cache_path, allow_pickle=True)
-        fields = {}
+        logger.info(f"[MoE cache] np.load() open in "
+                     f"{time.perf_counter()-t_open:.1f}s")
+        cache_fmt = str(data["_cache_format"]) if "_cache_format" in data \
+            else "legacy"
+        result = {}
         for name in ["w13_weight", "w13_weight_scale", "w13_bias",
                       "w2_weight", "w2_weight_scale", "w2_bias"]:
             if name in data:
                 dtype_str = str(data[f"{name}_dtype"])
-                jax_dtype = jnp.dtype(dtype_str)
-                fields[name] = jnp.array(data[name], dtype=jax_dtype)
+                t_read = time.perf_counter()
+                np_arr = data[name]
+                t_read_done = time.perf_counter()
+                if 'float4' in dtype_str and np_arr.ndim >= 2:
+                    if np_arr.dtype.kind == 'V':
+                        if cache_fmt == "fp8":
+                            # New format: void is float8_e4m3fn
+                            np_arr = np_arr.view(ml_dtypes.float8_e4m3fn)
+                        else:
+                            # Old format: void is float4 (original)
+                            fp4_dt = getattr(ml_dtypes, dtype_str, None)
+                            if fp4_dt:
+                                np_arr = np_arr.view(fp4_dt)
+                    if 'float8' in str(np_arr.dtype):
+                        # FP8 format: JAX can handle directly, no conversion
+                        logger.info(
+                            f"[MoE cache] {name}: read={t_read_done-t_read:.1f}s"
+                            f" (fp8) shape={np_arr.shape}")
+                    elif np_arr.dtype == np.float16:
+                        # Legacy FP16 format: also fine
+                        logger.info(
+                            f"[MoE cache] {name}: read={t_read_done-t_read:.1f}s"
+                            f" (f16) shape={np_arr.shape}")
+                    else:
+                        # Very old format: float4 → slow upcast
+                        t_cast = time.perf_counter()
+                        np_arr = np_arr.astype(np.float16)
+                        logger.info(
+                            f"[MoE cache] {name}: read={t_read_done-t_read:.1f}s"
+                            f" cast_f16={time.perf_counter()-t_cast:.1f}s"
+                            f" (OLD) shape={np_arr.shape}")
+                else:
+                    # Scales and other non-float4 arrays
+                    if np_arr.dtype.kind == 'V':
+                        ml_dt = getattr(ml_dtypes, dtype_str, None)
+                        if ml_dt is not None:
+                            np_arr = np_arr.view(ml_dt)
+                    logger.info(
+                        f"[MoE cache] {name}: read={t_read_done-t_read:.1f}s"
+                        f" dtype={np_arr.dtype} shape={np_arr.shape}")
+                result[name] = np_arr
+                result[f"{name}_target_dtype"] = dtype_str
             else:
-                fields[name] = None
-        return FusedMoEWeights(**fields)
+                result[name] = None
+                result[f"{name}_target_dtype"] = None
+        return result
     except Exception as e:
         logger.warning(f"Failed to load MoE cache from {cache_path}: {e}")
         return None
@@ -638,6 +850,14 @@ class Fp8FusedMoEMethod(QuantizeMethodBase):
            requantization. On subsequent startups, cached weights are
            loaded directly, skipping the expensive CPU requantization.
 
+        3. **Parallel cache prefetch** (automatic when caching is enabled):
+           On the first MoE cache hit, all cache files are queued for
+           parallel reading from Lustre (8 I/O threads). A semaphore
+           bounds memory to ~8 loaded results at a time. When
+           ``process_weights_after_loading()`` is called for subsequent
+           layers, the data is already in memory — only the shard_put
+           to TPU remains.
+
         Args:
             layer: The layer to process.
         """
@@ -648,34 +868,46 @@ class Fp8FusedMoEMethod(QuantizeMethodBase):
             up_scale_name = f"kernel_up_proj_EDF_{self.weight_scale_name}"
             down_scale_name = f"kernel_down_proj_EFD_{self.weight_scale_name}"
 
-            if any(
-                    any(w is None for w in param._weights_to_load) for param in
-                [
-                    getattr(layer, gating_scale_name),
-                    getattr(layer, up_scale_name),
-                    getattr(layer, down_scale_name), layer.kernel_gating_EDF,
-                    layer.kernel_up_proj_EDF, layer.kernel_down_proj_EFD
-                ]):
-                # If weights for a module is spread across multiple files,
-                # this function may be called more than once. We only want
-                # to process the weights once all of them are loaded.
-                return False
-
-            # Check if we can load from cache
-            cache_dir = envs.MOE_WEIGHT_CACHE_DIR
-            cache_path = (_get_moe_cache_path(cache_dir, layer.prefix)
-                          if cache_dir else None)
-            cached_weights = (_load_moe_cache(cache_path)
-                              if cache_path else None)
-
+            # Check cache BEFORE checking _weights_to_load.  When cache
+            # exists we can skip the safetensors expert weights entirely.
             t0 = time.perf_counter()
+            cache_dir = envs.MOE_WEIGHT_CACHE_DIR
+            cache_path = (_get_moe_cache_path(
+                              cache_dir, layer.prefix,
+                              moe_backend=layer.moe_backend,
+                              mesh=layer.mesh)
+                          if cache_dir else None)
 
-            if cached_weights is not None:
+            if cache_dir:
+                _start_moe_prefetch(cache_dir)
+
+            t_cache_start = time.perf_counter()
+            cached_data = None
+            if cache_path:
+                cached_data = _get_prefetched_cache(cache_path)
+                if cached_data is None:
+                    cached_data = _load_moe_cache(cache_path)
+            t_cache_load = time.perf_counter() - t_cache_start
+
+            is_cached = cached_data is not None
+            if is_cached:
                 logger.info(
-                    f"[MoE cache hit] Loading pre-processed weights for "
-                    f"{layer.prefix} from {cache_path}")
-                weights = cached_weights
+                    f"[MoE cache hit] {layer.prefix} ready in "
+                    f"{t_cache_load:.1f}s")
             else:
+                # No cache — must wait for all expert weights from safetensors
+                if any(
+                        any(w is None for w in param._weights_to_load)
+                        for param in [
+                            getattr(layer, gating_scale_name),
+                            getattr(layer, up_scale_name),
+                            getattr(layer, down_scale_name),
+                            layer.kernel_gating_EDF,
+                            layer.kernel_up_proj_EDF,
+                            layer.kernel_down_proj_EFD
+                        ]):
+                    return False
+
                 # Prepare fused input weights from per-expert tensors
                 with cpu_mesh_context():
                     w_gate = jnp.concatenate(
@@ -757,36 +989,108 @@ class Fp8FusedMoEMethod(QuantizeMethodBase):
             delattr(layer, gating_scale_name)
             delattr(layer, up_scale_name)
 
-            # TODO (jacobplatin): we probably want to make the sharding
-            # configurable
-            layer.kernel_gating_upproj_EDF = nnx.Param(
-                shard_put(weights.w13_weight, shardings=layer.edf_sharding))
-            layer.kernel_down_proj_EFD = nnx.Param(
-                shard_put(weights.w2_weight, shardings=layer.efd_sharding))
-            # gmm expects shape [num_groups, num_blocks, 1, n]
-            # TODO(gpolovets1): Make sure it works for gmm_v2 as well.
-            edf_scale_sharding = (layer.edf_sharding[0], ) + (None, ) * (
-                weights.w13_weight_scale.ndim - 2) + (
-                    layer.edf_sharding[-1], )
-            efd_scale_sharding = (layer.efd_sharding[0], ) + (None, ) * (
-                weights.w2_weight_scale.ndim - 2) + (
-                    layer.efd_sharding[-1], )
-            setattr(
-                layer, f"kernel_gating_upproj_EDF_{self.weight_scale_name}",
-                nnx.Param(
-                    shard_put(weights.w13_weight_scale,
-                              shardings=edf_scale_sharding)))
-            setattr(
-                layer, f"kernel_down_proj_EFD_{self.weight_scale_name}",
-                nnx.Param(
-                    shard_put(weights.w2_weight_scale,
-                              shardings=efd_scale_sharding)))
+            if is_cached:
+                # === FAST PATH: numpy → sharded JAX via make_array_from_callback ===
+                # This avoids the slow chunked jnp.array() loop by sending
+                # each numpy shard directly to its target TPU device.
+                from jax.sharding import NamedSharding, PartitionSpec as P
+                mesh = layer.mesh
+
+                def _shard_numpy_to_tpu(np_arr, sharding_spec, target_dtype):
+                    """Transfer numpy array to TPU with sharding, then cast."""
+                    named_sharding = NamedSharding(mesh, P(*sharding_spec))
+                    jax_arr = jax.make_array_from_callback(
+                        np_arr.shape, named_sharding,
+                        lambda index: np_arr[index])
+                    if target_dtype and 'float4' in target_dtype:
+                        jax_arr = jax_arr.astype(jnp.float4_e2m1fn)
+                    return jax_arr
+
+                t_shard = time.perf_counter()
+                w13_target = cached_data.get("w13_weight_target_dtype")
+                layer.kernel_gating_upproj_EDF = nnx.Param(
+                    _shard_numpy_to_tpu(
+                        cached_data["w13_weight"],
+                        layer.edf_sharding, w13_target))
+                t_w13 = time.perf_counter() - t_shard
+
+                t_shard2 = time.perf_counter()
+                w2_target = cached_data.get("w2_weight_target_dtype")
+                layer.kernel_down_proj_EFD = nnx.Param(
+                    _shard_numpy_to_tpu(
+                        cached_data["w2_weight"],
+                        layer.efd_sharding, w2_target))
+                t_w2 = time.perf_counter() - t_shard2
+
+                # Scales (float32, small — use regular shard_put)
+                w13_scale = cached_data["w13_weight_scale"]
+                w2_scale = cached_data["w2_weight_scale"]
+                edf_scale_sharding = (layer.edf_sharding[0], ) + (
+                    None, ) * (w13_scale.ndim - 2) + (
+                        layer.edf_sharding[-1], )
+                efd_scale_sharding = (layer.efd_sharding[0], ) + (
+                    None, ) * (w2_scale.ndim - 2) + (
+                        layer.efd_sharding[-1], )
+
+                t_shard3 = time.perf_counter()
+                setattr(
+                    layer,
+                    f"kernel_gating_upproj_EDF_{self.weight_scale_name}",
+                    nnx.Param(
+                        _shard_numpy_to_tpu(
+                            w13_scale, edf_scale_sharding, None)))
+                setattr(
+                    layer,
+                    f"kernel_down_proj_EFD_{self.weight_scale_name}",
+                    nnx.Param(
+                        _shard_numpy_to_tpu(
+                            w2_scale, efd_scale_sharding, None)))
+                t_scales = time.perf_counter() - t_shard3
+
+                is_cached = True
+                del cached_data
+            else:
+                # === STANDARD PATH: JAX arrays via shard_put ===
+                t_shard = time.perf_counter()
+                layer.kernel_gating_upproj_EDF = nnx.Param(
+                    shard_put(weights.w13_weight,
+                              shardings=layer.edf_sharding))
+                t_w13 = time.perf_counter() - t_shard
+                t_shard2 = time.perf_counter()
+                layer.kernel_down_proj_EFD = nnx.Param(
+                    shard_put(weights.w2_weight,
+                              shardings=layer.efd_sharding))
+                t_w2 = time.perf_counter() - t_shard2
+                # gmm expects shape [num_groups, num_blocks, 1, n]
+                # TODO(gpolovets1): Make sure it works for gmm_v2 as well.
+                edf_scale_sharding = (layer.edf_sharding[0], ) + (
+                    None, ) * (weights.w13_weight_scale.ndim - 2) + (
+                        layer.edf_sharding[-1], )
+                efd_scale_sharding = (layer.efd_sharding[0], ) + (
+                    None, ) * (weights.w2_weight_scale.ndim - 2) + (
+                        layer.efd_sharding[-1], )
+
+                t_shard3 = time.perf_counter()
+                setattr(
+                    layer,
+                    f"kernel_gating_upproj_EDF_{self.weight_scale_name}",
+                    nnx.Param(
+                        shard_put(weights.w13_weight_scale,
+                                  shardings=edf_scale_sharding)))
+                setattr(
+                    layer,
+                    f"kernel_down_proj_EFD_{self.weight_scale_name}",
+                    nnx.Param(
+                        shard_put(weights.w2_weight_scale,
+                                  shardings=efd_scale_sharding)))
+                t_scales = time.perf_counter() - t_shard3
 
             elapsed = time.perf_counter() - t0
-            label = "cached" if cached_weights else "requantized"
+            label = "cached" if is_cached else "requantized"
             logger.info(
                 f"[MoE weights] {layer.prefix} processed in {elapsed:.1f}s"
-                f" ({label})")
+                f" ({label}) | shard_put: w13={t_w13:.1f}s w2={t_w2:.1f}s "
+                f"scales={t_scales:.1f}s")
         else:
             raise NotImplementedError(
                 f"Unsupported moe backend: {layer.moe_backend}! "

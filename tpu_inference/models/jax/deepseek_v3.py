@@ -60,6 +60,8 @@ from tpu_inference.models.jax.jax_intermediate_tensor import \
     JaxIntermediateTensors
 from tpu_inference.models.jax.utils.weight_utils import (JaxAutoWeightsLoader,
                                                          LoadableWithIterator,
+                                                         _filtered_safetensors_iterator,
+                                                         _load_moe_from_cache,
                                                          shard_put)
 
 KVCache = Tuple[jax.Array, jax.Array]
@@ -1419,6 +1421,46 @@ class DeepseekV3ForCausalLM(JaxModule, LoadableWithIterator):
             # Use next parent class in MRO.
             return super().load_weights(weights)
 
+        from tpu_inference import envs
+        use_moe_cache = bool(envs.MOE_WEIGHT_CACHE_DIR)
+        moe_cache_hit = False
+
+        if use_moe_cache:
+            model_path = self.vllm_config.model_config.model
+            # Check if cache exists at config-specific path.
+            # If yes → filter safetensors (fast path).
+            # If no → load all safetensors normally so requantization can
+            #          generate and save the cache (first-run path).
+            from tpu_inference.layers.jax.quantization.fp8 import (
+                _get_config_cache_subdir,
+            )
+            # Compute moe_backend the same way the model does.
+            moe_backend = select_moe_backend(
+                get_expert_parallelism(
+                    ShardingAxisName.MLP_TENSOR, self.mesh) > 1
+                and self.vllm_config.sharding_config.tp_size
+                    * self.vllm_config.sharding_config.attn_dp_size == 1
+            )
+            if moe_backend is not None:
+                config_subdir = _get_config_cache_subdir(
+                    moe_backend, self.mesh)
+                config_cache_dir = os.path.join(
+                    envs.MOE_WEIGHT_CACHE_DIR, config_subdir)
+                moe_cache_hit = (
+                    os.path.isdir(config_cache_dir)
+                    and any(f.endswith('.npz')
+                            for f in os.listdir(config_cache_dir))
+                )
+            if moe_cache_hit:
+                logger.info(
+                    "[MoE cache] Cache found at %s, filtering safetensors",
+                    config_cache_dir)
+                weights = _filtered_safetensors_iterator(model_path)
+            else:
+                logger.info(
+                    "[MoE cache] No cache found, loading all safetensors "
+                    "for requantization")
+
         start_ignore_layer_num = len(self.model.layers)
         end_ignore_layer_num = 62  # last layer is MTP, we ignore it for now
         loader = JaxAutoWeightsLoader(
@@ -1431,6 +1473,12 @@ class DeepseekV3ForCausalLM(JaxModule, LoadableWithIterator):
             ],
         )
         loaded = loader.load_weights(weights)
+
+        # Trigger MoE cache loading for all MoE layers (only when cache
+        # was found; otherwise process_weights_after_loading already ran
+        # during normal weight loading and saved new cache files).
+        if moe_cache_hit:
+            _load_moe_from_cache(self)
 
         self.model.initialize_cache()
 
