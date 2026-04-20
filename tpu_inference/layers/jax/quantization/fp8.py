@@ -14,6 +14,7 @@
 
 import functools
 import glob
+import json
 import math
 import os
 import re
@@ -128,15 +129,22 @@ def _start_moe_prefetch(cache_dir: str) -> None:
                 if _config_subdir_cache else cache_dir)
     # Sort numerically by layer index so prefetch order matches
     # iter_modules() traversal order (layer 3, 4, 5, ...).
-    # Alphabetical sort puts "layers_10" before "layers_3", causing
-    # deadlock: semaphore slots fill with layers the consumer hasn't
-    # reached yet, blocking the layer it actually needs.
     def _layer_sort_key(path):
         m = re.search(r'layers_(\d+)', os.path.basename(path))
         return int(m.group(1)) if m else 0
 
-    cache_files = sorted(glob.glob(os.path.join(scan_dir, "*.npz")),
-                         key=_layer_sort_key)
+    # Discover cache entries: npy_v1 directories or legacy .npz files.
+    cache_dirs = sorted(
+        [d for d in glob.glob(os.path.join(scan_dir, "model_layers_*"))
+         if os.path.isdir(d)],
+        key=_layer_sort_key)
+    if cache_dirs:
+        cache_files = cache_dirs  # npy_v1 format
+    else:
+        # Legacy .npz fallback
+        cache_files = sorted(
+            glob.glob(os.path.join(scan_dir, "*.npz")),
+            key=_layer_sort_key)
     if not cache_files:
         return
 
@@ -184,15 +192,21 @@ def _get_prefetched_cache(cache_path: str):
 
 def _async_save_moe_cache(cache_path: str, weights: FusedMoEWeights,
                           prefix: str) -> None:
-    """Save MoE cache asynchronously — does not block the caller."""
+    """Save MoE cache asynchronously — does not block the caller.
 
+    Saves each array as an individual ``.npy`` file inside a directory
+    (``cache_path``), with a ``meta.json`` for dtype metadata.  This
+    replaces the old ``.npz`` (ZIP) format and enables ``mmap_mode='r'``
+    reads that bypass Python buffered I/O.
+
+    Float4 weights are stored as float8_e4m3fn — same byte size but
+    JAX-compatible (no numpy↔XLA packing mismatch).
+    """
+    import ml_dtypes
     # Materialize JAX arrays to numpy BEFORE submitting to avoid
     # cross-thread JAX issues. This forces lazy evaluation now.
-    # Store float4 weights as float8 — same size (1 byte/element),
-    # but JAX can ingest float8 directly (unlike float4 which has
-    # incompatible packing between numpy and XLA).
-    import ml_dtypes
-    save_dict = {"_cache_format": np.array("fp8", dtype=object)}
+    arrays_to_save: dict[str, np.ndarray] = {}
+    meta: dict[str, str] = {"_cache_format": "npy_v1"}
     for name in ["w13_weight", "w13_weight_scale", "w13_bias",
                   "w2_weight", "w2_weight_scale", "w2_bias"]:
         val = getattr(weights, name)
@@ -201,15 +215,17 @@ def _async_save_moe_cache(cache_path: str, weights: FusedMoEWeights,
             original_dtype = str(val.dtype)
             if 'float4' in original_dtype:
                 np_val = np_val.astype(ml_dtypes.float8_e4m3fn)
-            save_dict[name] = np_val
-            save_dict[f"{name}_dtype"] = np.array(
-                original_dtype, dtype=object)
+            arrays_to_save[name] = np_val
+            meta[f"{name}_dtype"] = original_dtype
 
     def _do_write():
         t0 = time.perf_counter()
         try:
-            os.makedirs(os.path.dirname(cache_path), exist_ok=True)
-            np.savez(cache_path, **save_dict)
+            os.makedirs(cache_path, exist_ok=True)
+            for name, arr in arrays_to_save.items():
+                np.save(os.path.join(cache_path, f"{name}.npy"), arr)
+            with open(os.path.join(cache_path, "meta.json"), "w") as f:
+                json.dump(meta, f)
             elapsed = time.perf_counter() - t0
             logger.info(
                 f"[MoE cache saved] {prefix} → {cache_path} "
@@ -317,21 +333,20 @@ def _get_moe_cache_path(
     safe_name = layer_prefix.replace(".", "_").replace("/", "_")
 
     if _config_subdir_cache:
-        return os.path.join(cache_dir, _config_subdir_cache,
-                            f"{safe_name}.npz")
+        return os.path.join(cache_dir, _config_subdir_cache, safe_name)
 
-    return os.path.join(cache_dir, f"{safe_name}.npz")
+    return os.path.join(cache_dir, safe_name)
 
 
 def _save_moe_cache(cache_path: str, weights: FusedMoEWeights) -> None:
-    """Save processed MoE weights to disk as .npz.
+    """Save processed MoE weights as individual .npy files.
 
     Float4 weights are stored as float8_e4m3fn — same byte size but
     JAX-compatible (no numpy↔XLA packing mismatch).
     """
     import ml_dtypes
-    os.makedirs(os.path.dirname(cache_path), exist_ok=True)
-    save_dict = {"_cache_format": np.array("fp8", dtype=object)}
+    os.makedirs(cache_path, exist_ok=True)
+    meta: dict[str, str] = {"_cache_format": "npy_v1"}
     for name in ["w13_weight", "w13_weight_scale", "w13_bias",
                   "w2_weight", "w2_weight_scale", "w2_bias"]:
         val = getattr(weights, name)
@@ -340,22 +355,68 @@ def _save_moe_cache(cache_path: str, weights: FusedMoEWeights) -> None:
             original_dtype = str(val.dtype)
             if 'float4' in original_dtype:
                 np_val = np_val.astype(ml_dtypes.float8_e4m3fn)
-            save_dict[name] = np_val
-            save_dict[f"{name}_dtype"] = np.array(
-                original_dtype, dtype=object)
-    np.savez(cache_path, **save_dict)
+            np.save(os.path.join(cache_path, f"{name}.npy"), np_val)
+            meta[f"{name}_dtype"] = original_dtype
+    with open(os.path.join(cache_path, "meta.json"), "w") as f:
+        json.dump(meta, f)
 
 
-def _load_moe_cache(
+def _load_moe_cache_npy(
+    cache_dir: str,
+) -> dict[str, np.ndarray | str | None] | None:
+    """Load MoE cache from npy_v1 format (directory of .npy files).
+
+    Uses ``mmap_mode='r'`` so data is memory-mapped from Lustre and
+    pages are loaded on demand by the OS, bypassing Python buffered I/O
+    and ZIP decompression overhead.
+    """
+    meta_path = os.path.join(cache_dir, "meta.json")
+    if not os.path.exists(meta_path):
+        return None
+    try:
+        import ml_dtypes
+        with open(meta_path) as f:
+            meta = json.load(f)
+
+        result = {}
+        for name in ["w13_weight", "w13_weight_scale", "w13_bias",
+                      "w2_weight", "w2_weight_scale", "w2_bias"]:
+            npy_path = os.path.join(cache_dir, f"{name}.npy")
+            if os.path.exists(npy_path):
+                dtype_str = meta.get(f"{name}_dtype", "")
+                t_read = time.perf_counter()
+                np_arr = np.load(npy_path, mmap_mode='r')
+                t_read_done = time.perf_counter()
+                # Handle dtype views (same logic as npz path)
+                if 'float4' in dtype_str and np_arr.ndim >= 2:
+                    if np_arr.dtype.kind == 'V':
+                        np_arr = np_arr.view(ml_dtypes.float8_e4m3fn)
+                    logger.info(
+                        f"[MoE cache] {name}: mmap={t_read_done-t_read:.3f}s"
+                        f" dtype={np_arr.dtype} shape={np_arr.shape}")
+                else:
+                    if np_arr.dtype.kind == 'V':
+                        ml_dt = getattr(ml_dtypes, dtype_str, None)
+                        if ml_dt is not None:
+                            np_arr = np_arr.view(ml_dt)
+                    logger.info(
+                        f"[MoE cache] {name}: mmap={t_read_done-t_read:.3f}s"
+                        f" dtype={np_arr.dtype} shape={np_arr.shape}")
+                result[name] = np_arr
+                result[f"{name}_target_dtype"] = dtype_str
+            else:
+                result[name] = None
+                result[f"{name}_target_dtype"] = None
+        return result
+    except Exception as e:
+        logger.warning(f"Failed to load MoE cache from {cache_dir}: {e}")
+        return None
+
+
+def _load_moe_cache_npz(
     cache_path: str,
 ) -> dict[str, np.ndarray | str | None] | None:
-    """Load processed MoE weights from cache as numpy arrays.
-
-    Returns a dict with numpy arrays and their target JAX dtypes.
-    The caller handles host→device transfer via jax.make_array_from_callback
-    so each TPU device only receives its shard (avoids int32 element limit
-    and eliminates the slow chunked jnp.array() loop).
-    """
+    """Load MoE cache from legacy .npz format (ZIP container)."""
     if not os.path.exists(cache_path):
         return None
     try:
@@ -377,25 +438,20 @@ def _load_moe_cache(
                 if 'float4' in dtype_str and np_arr.ndim >= 2:
                     if np_arr.dtype.kind == 'V':
                         if cache_fmt == "fp8":
-                            # New format: void is float8_e4m3fn
                             np_arr = np_arr.view(ml_dtypes.float8_e4m3fn)
                         else:
-                            # Old format: void is float4 (original)
                             fp4_dt = getattr(ml_dtypes, dtype_str, None)
                             if fp4_dt:
                                 np_arr = np_arr.view(fp4_dt)
                     if 'float8' in str(np_arr.dtype):
-                        # FP8 format: JAX can handle directly, no conversion
                         logger.info(
                             f"[MoE cache] {name}: read={t_read_done-t_read:.1f}s"
                             f" (fp8) shape={np_arr.shape}")
                     elif np_arr.dtype == np.float16:
-                        # Legacy FP16 format: also fine
                         logger.info(
                             f"[MoE cache] {name}: read={t_read_done-t_read:.1f}s"
                             f" (f16) shape={np_arr.shape}")
                     else:
-                        # Very old format: float4 → slow upcast
                         t_cast = time.perf_counter()
                         np_arr = np_arr.astype(np.float16)
                         logger.info(
@@ -403,7 +459,6 @@ def _load_moe_cache(
                             f" cast_f16={time.perf_counter()-t_cast:.1f}s"
                             f" (OLD) shape={np_arr.shape}")
                 else:
-                    # Scales and other non-float4 arrays
                     if np_arr.dtype.kind == 'V':
                         ml_dt = getattr(ml_dtypes, dtype_str, None)
                         if ml_dt is not None:
@@ -420,6 +475,21 @@ def _load_moe_cache(
     except Exception as e:
         logger.warning(f"Failed to load MoE cache from {cache_path}: {e}")
         return None
+
+
+def _load_moe_cache(
+    cache_path: str,
+) -> dict[str, np.ndarray | str | None] | None:
+    """Load MoE cache — tries npy_v1 (directory) first, falls back to .npz."""
+    # New format: cache_path is a directory with .npy files + meta.json
+    if os.path.isdir(cache_path):
+        result = _load_moe_cache_npy(cache_path)
+        if result is not None:
+            return result
+    # Legacy fallback: cache_path.npz
+    npz_path = cache_path + ".npz" if not cache_path.endswith(".npz") \
+        else cache_path
+    return _load_moe_cache_npz(npz_path)
 
 
 def load_fp8_weight(jax_param: nnx.Param, torch_weight: torch.Tensor,

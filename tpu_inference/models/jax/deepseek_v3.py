@@ -1446,10 +1446,13 @@ class DeepseekV3ForCausalLM(JaxModule, LoadableWithIterator):
                     moe_backend, self.mesh)
                 config_cache_dir = os.path.join(
                     envs.MOE_WEIGHT_CACHE_DIR, config_subdir)
+                # Check for npy_v1 dirs or legacy .npz files
                 moe_cache_hit = (
                     os.path.isdir(config_cache_dir)
-                    and any(f.endswith('.npz')
-                            for f in os.listdir(config_cache_dir))
+                    and any(
+                        os.path.isdir(os.path.join(config_cache_dir, f))
+                        or f.endswith('.npz')
+                        for f in os.listdir(config_cache_dir))
                 )
             if moe_cache_hit:
                 logger.info(
