@@ -166,14 +166,47 @@ def get_model_weights_files(
     return weights_files
 
 
-def _filter_moe_shards(model_path: str,
-                        weights_files: list[str]) -> list[str]:
-    """Skip safetensors shards that only contain MoE expert keys.
+def _discover_cached_moe_layers(cache_dir: str) -> set[int]:
+    """Find which MoE layer indices already have cache files on disk.
 
-    When MoE weight cache is active, expert weights are loaded from .npz
-    cache files instead of safetensors.  This function reads the safetensors
-    index to identify shards where every key matches ``mlp.experts`` and
-    removes them from the loading list, avoiding wasteful I/O.
+    Scans all known config subdirectories under *cache_dir* for directories
+    matching ``model_layers_{N}_mlp_experts`` and returns a set of layer
+    indices that have a valid cache (meta.json exists).
+    """
+    cached: set[int] = set()
+    # Scan all subdirs (config-specific) + top-level
+    scan_dirs = [cache_dir]
+    try:
+        scan_dirs += [
+            os.path.join(cache_dir, d)
+            for d in os.listdir(cache_dir)
+            if os.path.isdir(os.path.join(cache_dir, d))
+        ]
+    except OSError:
+        pass
+    for scan_dir in scan_dirs:
+        for entry in glob.glob(
+                os.path.join(scan_dir, "model_layers_*_mlp_experts")):
+            if not os.path.isdir(entry):
+                continue
+            meta = os.path.join(entry, "meta.json")
+            if os.path.exists(meta):
+                m = re.search(r'layers_(\d+)', os.path.basename(entry))
+                if m:
+                    cached.add(int(m.group(1)))
+    return cached
+
+
+def _filter_moe_shards(model_path: str,
+                        weights_files: list[str],
+                        cached_layers: set[int] | None = None,
+                        ) -> list[str]:
+    """Skip safetensors shards that only contain MoE expert keys
+    for layers whose cache already exists.
+
+    When *cached_layers* is provided, only skips shards where EVERY
+    MoE layer in the shard has a cache file.  If *cached_layers* is
+    None (legacy), skips all pure-MoE shards unconditionally.
     """
     index_path = os.path.join(model_path, "model.safetensors.index.json")
     if not os.path.exists(index_path):
@@ -182,20 +215,42 @@ def _filter_moe_shards(model_path: str,
     with open(index_path) as f:
         index = json.load(f)
 
+    # Build per-shard info: which keys are MoE, which layer indices
     shard_has_non_moe = set()
+    shard_moe_layers: dict[str, set[int]] = defaultdict(set)
     for key, shard in index["weight_map"].items():
         if "mlp.experts" not in key:
             shard_has_non_moe.add(shard)
+        else:
+            # Extract layer index from key like "model.layers.3.mlp.experts..."
+            m = re.search(r'layers\.(\d+)', key)
+            if m:
+                shard_moe_layers[shard].add(int(m.group(1)))
 
     original_count = len(weights_files)
-    filtered = [
-        f for f in weights_files
-        if os.path.basename(f) in shard_has_non_moe
-    ]
+    filtered = []
+    for f in weights_files:
+        basename = os.path.basename(f)
+        if basename in shard_has_non_moe:
+            # Shard has non-MoE keys — always load
+            filtered.append(f)
+        elif cached_layers is not None:
+            # Pure-MoE shard: only skip if ALL its layers have cache
+            layers_in_shard = shard_moe_layers.get(basename, set())
+            if not layers_in_shard or not layers_in_shard.issubset(
+                    cached_layers):
+                # Some layers missing cache — must load this shard
+                filtered.append(f)
+        # else: cached_layers is None → skip all pure-MoE (legacy)
+
     skipped = original_count - len(filtered)
     if skipped > 0:
-        logger.info("[MoE cache filter] Skipped %d/%d pure-MoE shards",
-                    skipped, original_count)
+        logger.info("[MoE cache filter] Skipped %d/%d pure-MoE shards "
+                    "(%d/%d layers cached)",
+                    skipped, original_count,
+                    len(cached_layers) if cached_layers else 0,
+                    len(set().union(*shard_moe_layers.values()))
+                    if shard_moe_layers else 0)
     return filtered
 
 
@@ -594,14 +649,27 @@ def load_hf_weights(
         weights_files = get_model_weights_files(
             model_path, vllm_config.load_config.download_dir)
         # When MoE cache is active, skip pure-MoE shards and filter
-        # MoE keys from mixed shards to avoid redundant I/O.
+        # MoE keys from mixed shards — but ONLY for layers that
+        # already have cache files.  Uncached layers must still be
+        # loaded from safetensors for requantization.
         if envs.MOE_WEIGHT_CACHE_DIR:
-            weights_files = _filter_moe_shards(model_path, weights_files)
-            moe_exclude = r"^(?!.*mlp\.experts).*$"
-            if filter_regex:
-                filter_regex = f"(?={filter_regex})({moe_exclude})"
-            else:
-                filter_regex = moe_exclude
+            cached_layers = _discover_cached_moe_layers(
+                envs.MOE_WEIGHT_CACHE_DIR)
+            if cached_layers:
+                logger.info("[MoE cache] Found cache for %d layers: %s",
+                            len(cached_layers), sorted(cached_layers))
+            weights_files = _filter_moe_shards(
+                model_path, weights_files, cached_layers)
+            # Only filter expert keys for cached layers, not all
+            if cached_layers:
+                # Build regex: skip mlp.experts keys for cached layers only
+                layer_alts = "|".join(str(i) for i in sorted(cached_layers))
+                moe_exclude = (
+                    rf"^(?!.*layers\.({layer_alts})\.mlp\.experts).*$")
+                if filter_regex:
+                    filter_regex = f"(?={filter_regex})({moe_exclude})"
+                else:
+                    filter_regex = moe_exclude
         max_workers = min(64, len(weights_files))
         # NOTE(xiang): Disable multi-threading mode if running on multi-host.
         # Because multi-threading would cause different JAX processes to load
@@ -956,8 +1024,11 @@ def _load_moe_from_cache(model: "nnx.Module") -> None:
     walks the model tree, finds MoE modules with a quant_method,
     and calls process_weights_after_loading directly.
     """
+    from tqdm import tqdm
     from tpu_inference.layers.jax.moe.moe import JaxMoE
-    loaded = 0
+
+    # First pass: collect all MoE expert modules
+    moe_modules = []
     for path, module in model.iter_modules():
         if not isinstance(module, JaxMoE):
             continue
@@ -966,46 +1037,62 @@ def _load_moe_from_cache(model: "nnx.Module") -> None:
             continue
         if not hasattr(qm, "process_weights_after_loading"):
             continue
-        # Only process MoE expert modules (SharedFusedMoe), skip routers.
-        # Routers are JaxMoE subclasses but don't have expert weights.
         if not hasattr(module, 'kernel_gating_EDF'):
-            logger.debug("[MoE cache] Skipping non-expert JaxMoE: %s (%s)",
-                         path, type(module).__name__)
             continue
-        logger.info("[MoE cache] Processing %s (%s)", path,
-                    type(module).__name__)
+        moe_modules.append((path, module, qm))
+
+    if not moe_modules:
+        return
+
+    loaded = 0
+    cached = 0
+    generated = 0
+    t_start = time.time()
+    for path, module, qm in tqdm(moe_modules,
+                                  desc="MoE cache load/generate"):
         success = qm.process_weights_after_loading(module)
         if success:
             loaded += 1
-            # Clear XLA compilation caches periodically to prevent HBM OOM.
-            # The cached path mostly uses eager ops (make_array_from_callback)
-            # but astype(float4) produces a small compilation each time.
+            # Track cache hit vs miss from the layer's last log
+            if hasattr(module, '_last_cache_hit'):
+                if module._last_cache_hit:
+                    cached += 1
+                else:
+                    generated += 1
             if loaded % 10 == 0:
                 jax.clear_caches()
     if loaded:
-        jax.clear_caches()  # Final cleanup
-        logger.info("[MoE cache] Loaded %d MoE layers from cache", loaded)
+        jax.clear_caches()
+        elapsed = time.time() - t_start
+        logger.info("[MoE cache] Done: %d layers in %.1fs "
+                    "(%d cached, %d generated)",
+                    loaded, elapsed, cached, generated)
 
 
 def _moe_cache_weight_filter(
     weights: Iterable[tuple[str, torch.Tensor]],
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
-    """Filter out MoE expert weights when MoE cache is active.
+    """Filter out MoE expert weights for layers that have cache.
 
-    When MOE_WEIGHT_CACHE_DIR is set, expert weights are loaded from
-    pre-quantized .npz cache files instead of safetensors.  This
-    generator skips ``mlp.experts`` keys so the upstream iterator can
-    avoid reading them from disk (safetensors reads are lazy per-key).
+    Only skips ``mlp.experts`` keys for layers whose cache already
+    exists on disk.  Uncached layers' expert weights pass through
+    so they can be requantized and cached on first run.
     """
+    cached_layers = _discover_cached_moe_layers(envs.MOE_WEIGHT_CACHE_DIR)
     skipped = 0
+    passed = 0
     for name, tensor in weights:
-        if "mlp.experts" in name:
-            skipped += 1
-            continue
+        if "mlp.experts" in name and cached_layers:
+            m = re.search(r'layers\.(\d+)', name)
+            if m and int(m.group(1)) in cached_layers:
+                skipped += 1
+                continue
+            passed += 1
         yield name, tensor
-    if skipped:
-        logger.info("[MoE cache filter] Skipped %d expert weight keys "
-                    "from safetensors", skipped)
+    if skipped or passed:
+        logger.info("[MoE cache filter] Skipped %d cached expert keys, "
+                    "passed %d uncached expert keys",
+                    skipped, passed)
 
 
 def _filtered_safetensors_iterator(
@@ -1029,13 +1116,16 @@ def _filtered_safetensors_iterator(
                                                    "*.safetensors")))
     original_count = len(weights_files)
 
-    # Level 1: Skip pure-MoE shards entirely
-    weights_files = _filter_moe_shards(model_path, weights_files)
+    # Level 1: Skip pure-MoE shards — only for layers with cache
+    cached_layers = _discover_cached_moe_layers(envs.MOE_WEIGHT_CACHE_DIR)
+    weights_files = _filter_moe_shards(model_path, weights_files,
+                                        cached_layers)
     logger.info(
         "[MoE cache] Loading %d/%d safetensors shards "
-        "(skipped %d pure-MoE)",
+        "(skipped %d, %d layers cached)",
         len(weights_files), original_count,
-        original_count - len(weights_files))
+        original_count - len(weights_files),
+        len(cached_layers))
 
     skipped_keys = 0
     loaded_keys = 0
@@ -1043,10 +1133,12 @@ def _filtered_safetensors_iterator(
                         desc="Loading safetensors (MoE-filtered)"):
         with safe_open(st_file, framework="pt") as f:
             for name in f.keys():
-                # Level 2: Skip MoE keys before reading tensor data
-                if "mlp.experts" in name:
-                    skipped_keys += 1
-                    continue
+                # Level 2: Skip MoE keys only for cached layers
+                if "mlp.experts" in name and cached_layers:
+                    m = re.search(r'layers\.(\d+)', name)
+                    if m and int(m.group(1)) in cached_layers:
+                        skipped_keys += 1
+                        continue
                 param = f.get_tensor(name)
                 loaded_keys += 1
                 yield name, param
