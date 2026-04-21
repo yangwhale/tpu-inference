@@ -1053,6 +1053,11 @@ def _load_moe_from_cache(model: "nnx.Module") -> None:
         success = qm.process_weights_after_loading(module)
         if success:
             loaded += 1
+            # Block per layer to avoid overwhelming TPU DMA queue.
+            # Without this, 58 layers x 4 arrays x 8 devices = 1856
+            # concurrent DMA ops can deadlock libtpu.
+            if hasattr(module, 'kernel_gating_upproj_EDF'):
+                module.kernel_gating_upproj_EDF.value.block_until_ready()
             # Track cache hit vs miss from the layer's last log
             if hasattr(module, '_last_cache_hit'):
                 if module._last_cache_hit:

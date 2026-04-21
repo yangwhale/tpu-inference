@@ -390,7 +390,11 @@ def _load_moe_cache_npy(
                 # Handle dtype views (same logic as npz path)
                 if 'float4' in dtype_str and np_arr.ndim >= 2:
                     if np_arr.dtype.kind == 'V':
-                        np_arr = np_arr.view(ml_dtypes.float8_e4m3fn)
+                        storage_fmt = meta.get('_storage_format', '')
+                        if storage_fmt == 'native_fp4':
+                            np_arr = np_arr.view(ml_dtypes.float4_e2m1fn)
+                        else:
+                            np_arr = np_arr.view(ml_dtypes.float8_e4m3fn)
                     logger.info(
                         f"[MoE cache] {name}: mmap={t_read_done-t_read:.3f}s"
                         f" dtype={np_arr.dtype} shape={np_arr.shape}")
@@ -1083,7 +1087,9 @@ class Fp8FusedMoEMethod(QuantizeMethodBase):
                         np_arr.shape, named_sharding,
                         lambda index: np_arr[index])
                     if target_dtype and 'float4' in target_dtype:
-                        jax_arr = jax_arr.astype(jnp.float4_e2m1fn)
+                        # Skip astype if already native FP4
+                        if 'float4' not in str(np_arr.dtype):
+                            jax_arr = jax_arr.astype(jnp.float4_e2m1fn)
                     return jax_arr
 
                 t_shard = time.perf_counter()
