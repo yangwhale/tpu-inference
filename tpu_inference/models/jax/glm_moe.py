@@ -69,20 +69,6 @@ KVCache = Tuple[jax.Array, jax.Array]
 logger = init_logger(__name__)
 
 # Register glm_moe_dsa config type with transformers.
-# GLM-5.1 uses model_type="glm_moe_dsa" which isn't in any released transformers.
-# Config fields are compatible with DeepseekV3Config.
-try:
-    from transformers import AutoConfig
-    from transformers.models.deepseek_v3.configuration_deepseek_v3 import \
-        DeepseekV3Config
-
-    class GlmMoeDsaConfig(DeepseekV3Config):
-        model_type = "glm_moe_dsa"
-
-    AutoConfig.register("glm_moe_dsa", GlmMoeDsaConfig)
-except Exception:
-    pass  # Non-fatal: only needed when loading from HF config
-
 
 def _weight_init(random_init: bool):
     return sharded_initializer if random_init else nnx.initializers.uniform()
