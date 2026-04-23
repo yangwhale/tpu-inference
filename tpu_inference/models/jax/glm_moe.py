@@ -1446,10 +1446,10 @@ class GlmMoeForCausalLM(JaxModule, LoadableWithIterator):
                     "[MoE cache] No cache found, loading all safetensors "
                     "for requantization")
 
-        hf_config = self.vllm_config.model_config.hf_config
         start_ignore_layer_num = len(self.model.layers)
-        num_mtp = getattr(hf_config, 'num_nextn_predict_layers', 0)
-        end_ignore_layer_num = hf_config.num_hidden_layers + num_mtp
+        # Use a fixed upper bound (78 transformer + 1 MTP = 79) to skip all
+        # extra layers in safetensors, even when --hf-overrides reduces layers.
+        end_ignore_layer_num = 79
         skip_substrs = [
             f"layers.{i}"
             for i in range(start_ignore_layer_num, end_ignore_layer_num)
