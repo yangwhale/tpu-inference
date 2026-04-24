@@ -1160,8 +1160,17 @@ def _filtered_safetensors_iterator(
 
     # Level 1: Skip pure-MoE shards — only for layers with cache
     cached_layers = _discover_cached_moe_layers(envs.MOE_WEIGHT_CACHE_DIR)
-    weights_files = _filter_moe_shards(model_path, weights_files,
-                                        cached_layers)
+
+    # Check for consolidated non-MoE cache first
+    non_moe_cache = _find_non_moe_cache(envs.MOE_WEIGHT_CACHE_DIR)
+    if non_moe_cache and cached_layers:
+        logger.info(
+            "[non-MoE cache] Using %s instead of %d safetensors shards",
+            non_moe_cache, original_count)
+        weights_files = [non_moe_cache]
+    else:
+        weights_files = _filter_moe_shards(model_path, weights_files,
+                                            cached_layers)
     logger.info(
         "[MoE cache] Loading %d/%d safetensors shards "
         "(skipped %d, %d layers cached)",
