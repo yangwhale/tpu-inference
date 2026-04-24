@@ -136,7 +136,8 @@ def _start_moe_prefetch(cache_dir: str) -> None:
     # Discover cache entries: npy_v1 directories or legacy .npz files.
     cache_dirs = sorted(
         [d for d in glob.glob(os.path.join(scan_dir, "model_layers_*"))
-         if os.path.isdir(d)],
+         if os.path.isdir(d)
+         and os.path.exists(os.path.join(d, "meta.json"))],
         key=_layer_sort_key)
     if cache_dirs:
         cache_files = cache_dirs  # npy_v1 format
