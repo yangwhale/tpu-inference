@@ -197,6 +197,29 @@ def _discover_cached_moe_layers(cache_dir: str) -> set[int]:
     return cached
 
 
+def _find_non_moe_cache(cache_dir: str) -> str | None:
+    """Look for a consolidated non-MoE weights file in the cache directory.
+
+    Checks both config-specific subdirectories and the top-level cache dir
+    for ``non_moe_weights.safetensors``.  Returns the path if found, else
+    None.
+    """
+    candidates = [cache_dir]
+    try:
+        candidates += [
+            os.path.join(cache_dir, d)
+            for d in os.listdir(cache_dir)
+            if os.path.isdir(os.path.join(cache_dir, d))
+        ]
+    except OSError:
+        pass
+    for d in candidates:
+        path = os.path.join(d, "non_moe_weights.safetensors")
+        if os.path.isfile(path):
+            return path
+    return None
+
+
 def _filter_moe_shards(model_path: str,
                         weights_files: list[str],
                         cached_layers: set[int] | None = None,
@@ -658,18 +681,32 @@ def load_hf_weights(
             if cached_layers:
                 logger.info("[MoE cache] Found cache for %d layers: %s",
                             len(cached_layers), sorted(cached_layers))
-            weights_files = _filter_moe_shards(
-                model_path, weights_files, cached_layers)
-            # Only filter expert keys for cached layers, not all
-            if cached_layers:
-                # Build regex: skip mlp.experts keys for cached layers only
-                layer_alts = "|".join(str(i) for i in sorted(cached_layers))
-                moe_exclude = (
-                    rf"^(?!.*layers\.({layer_alts})\.mlp\.experts).*$")
-                if filter_regex:
-                    filter_regex = f"(?={filter_regex})({moe_exclude})"
-                else:
-                    filter_regex = moe_exclude
+            # Check for consolidated non-MoE cache file.
+            # If present, use it instead of reading many mixed shards.
+            non_moe_cache = _find_non_moe_cache(
+                envs.MOE_WEIGHT_CACHE_DIR)
+            if non_moe_cache and cached_layers:
+                logger.info(
+                    "[non-MoE cache] Using %s instead of %d "
+                    "safetensors shards",
+                    non_moe_cache, len(weights_files))
+                weights_files = [non_moe_cache]
+                # No MoE key filtering needed — file has no MoE keys
+            else:
+                weights_files = _filter_moe_shards(
+                    model_path, weights_files, cached_layers)
+                # Only filter expert keys for cached layers, not all
+                if cached_layers:
+                    layer_alts = "|".join(
+                        str(i) for i in sorted(cached_layers))
+                    moe_exclude = (
+                        rf"^(?!.*layers\.({layer_alts})"
+                        rf"\.mlp\.experts).*$")
+                    if filter_regex:
+                        filter_regex = (
+                            f"(?={filter_regex})({moe_exclude})")
+                    else:
+                        filter_regex = moe_exclude
         max_workers = min(64, len(weights_files))
         # NOTE(xiang): Disable multi-threading mode if running on multi-host.
         # Because multi-threading would cause different JAX processes to load
