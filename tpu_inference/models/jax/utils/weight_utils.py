@@ -1137,6 +1137,131 @@ def _moe_cache_weight_filter(
                     skipped, passed)
 
 
+def parallel_load_non_moe_cache(
+    model: "nnx.Module",
+    non_moe_cache_path: str,
+    skip_prefixes: list[str] | None = None,
+    skip_substrs: list[str] | None = None,
+    max_workers: int = 32,
+) -> int:
+    """Load non-MoE weights in parallel using ThreadPoolExecutor.
+
+    Pre-reads all tensors from the consolidated cache file (fast on SHM),
+    then dispatches weight_loader callbacks across threads for parallel
+    shard_put to TPU devices.
+
+    Args:
+        model: The JAX model with weight_loader metadata already set
+               (via JaxAutoWeightsLoader.__init__).
+        non_moe_cache_path: Path to the non_moe_weights.safetensors file.
+        skip_prefixes: HF key prefixes to skip (e.g., ["lm_head"]).
+        skip_substrs: HF key substrings to skip (e.g., ["layers.77"]).
+        max_workers: Number of threads for parallel processing.
+
+    Returns:
+        Number of successfully loaded weights.
+    """
+    from concurrent.futures import as_completed
+
+    skip_prefixes = skip_prefixes or []
+    skip_substrs = skip_substrs or []
+
+    # Step 1: Pre-read all tensors from SHM (fast — ~1s for 21GB)
+    logger.info("[parallel non-MoE] Reading all tensors from %s",
+                non_moe_cache_path)
+    t0 = time.perf_counter()
+    all_weights = {}
+    with safe_open(non_moe_cache_path, framework="pt") as f:
+        for name in f.keys():
+            all_weights[name] = f.get_tensor(name)
+    t_read = time.perf_counter() - t0
+    logger.info("[parallel non-MoE] Read %d tensors in %.1fs",
+                len(all_weights), t_read)
+
+    # Step 2: Build param lookup from model's named_parameters.
+    # JaxAutoWeightsLoader.__init__() must have run first to set up
+    # weight_loader metadata on each param.
+    param_by_name = {}
+    for pname, param in model.named_parameters():
+        param_by_name[pname] = param
+        # Also index without .weight suffix for matching
+        if pname.endswith(".weight"):
+            param_by_name[pname.removesuffix(".weight")] = param
+
+    # Step 3: Filter and match
+    tasks = []  # (hf_name, tensor, param)
+    skipped = 0
+    unmatched = []
+    for hf_name, tensor in all_weights.items():
+        # Apply skip filters
+        if any(s in hf_name for s in skip_substrs):
+            skipped += 1
+            continue
+        if any(hf_name.startswith(p) for p in skip_prefixes):
+            skipped += 1
+            continue
+
+        # Match to model param
+        param = param_by_name.get(hf_name)
+        if param is None and hf_name.endswith(".weight"):
+            param = param_by_name.get(hf_name.removesuffix(".weight"))
+        if param is None:
+            unmatched.append(hf_name)
+            continue
+
+        tasks.append((hf_name, tensor, param))
+
+    if unmatched:
+        logger.warning("[parallel non-MoE] %d unmatched keys (first 5): %s",
+                       len(unmatched), unmatched[:5])
+    logger.info("[parallel non-MoE] %d keys to load, %d skipped, "
+                "%d unmatched, using %d threads",
+                len(tasks), skipped, len(unmatched),
+                min(max_workers, len(tasks)))
+
+    # Step 4: Process in parallel
+    loaded = 0
+    errors = 0
+
+    def _process(hf_name, tensor, param):
+        wl = None
+        if hasattr(param, 'get_metadata'):
+            try:
+                wl = param.get_metadata("weight_loader")
+            except KeyError:
+                pass
+        if wl is not None:
+            wl(param, tensor)
+        else:
+            # Fallback: direct reshape+shard (2D → transpose, 1D → as-is)
+            jax_weight = jax_array_from_reshaped_torch(tensor)
+            assign_and_shard_param(param, jax_weight, param_name=hf_name)
+
+    t1 = time.perf_counter()
+    with ThreadPoolExecutor(
+            max_workers=min(max_workers, len(tasks))) as executor:
+        futures = {
+            executor.submit(_process, name, tensor, param): name
+            for name, tensor, param in tasks
+        }
+        for future in as_completed(futures):
+            name = futures[future]
+            try:
+                future.result()
+                loaded += 1
+            except Exception as e:
+                errors += 1
+                logger.error("[parallel non-MoE] Failed to load %s: %s",
+                             name, e)
+
+    t_proc = time.perf_counter() - t1
+    t_total = time.perf_counter() - t0
+    logger.info("[parallel non-MoE] Loaded %d keys in %.1fs "
+                "(read=%.1fs, process=%.1fs), %d errors",
+                loaded, t_total, t_read, t_proc, errors)
+    return loaded
+
+
 def _filtered_safetensors_iterator(
     model_path: str,
 ) -> Generator[tuple[str, torch.Tensor], None, None]:

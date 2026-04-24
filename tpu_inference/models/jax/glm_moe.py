@@ -61,7 +61,9 @@ from tpu_inference.models.jax.jax_intermediate_tensor import \
 from tpu_inference.models.jax.utils.weight_utils import (JaxAutoWeightsLoader,
                                                          LoadableWithIterator,
                                                          _filtered_safetensors_iterator,
+                                                         _find_non_moe_cache,
                                                          _load_moe_from_cache,
+                                                         parallel_load_non_moe_cache,
                                                          shard_put)
 
 KVCache = Tuple[jax.Array, jax.Array]
@@ -1459,12 +1461,35 @@ class GlmMoeForCausalLM(JaxModule, LoadableWithIterator):
         skip_prefixes = ["lm_head"] if not hasattr(self, 'lm_head') else []
         # MTP-specific top-level weights (model.eh_proj, model.enorm, etc.)
         skip_prefixes += ["eh_proj", "enorm", "hnorm", "shared_head"]
-        loader = JaxAutoWeightsLoader(
-            self,
-            skip_prefixes=skip_prefixes,
-            skip_substrs=skip_substrs,
-        )
-        loaded = loader.load_weights(weights)
+
+        # Try parallel loading path for non-MoE cache
+        non_moe_cache = None
+        if moe_cache_hit:
+            non_moe_cache = _find_non_moe_cache(envs.MOE_WEIGHT_CACHE_DIR)
+
+        if non_moe_cache:
+            # Parallel path: pre-read all tensors, then process concurrently.
+            # Init JaxAutoWeightsLoader to set up weight_loader metadata,
+            # then use parallel_load_non_moe_cache for actual loading.
+            loader = JaxAutoWeightsLoader(
+                self,
+                skip_prefixes=skip_prefixes,
+                skip_substrs=skip_substrs,
+            )
+            loaded_count = parallel_load_non_moe_cache(
+                self, non_moe_cache,
+                skip_prefixes=skip_prefixes,
+                skip_substrs=skip_substrs,
+            )
+            loaded = set()  # parallel path doesn't track names
+        else:
+            # Sequential path: original JaxAutoWeightsLoader
+            loader = JaxAutoWeightsLoader(
+                self,
+                skip_prefixes=skip_prefixes,
+                skip_substrs=skip_substrs,
+            )
+            loaded = loader.load_weights(weights)
 
         # Trigger MoE cache loading for all MoE layers (only when cache
         # was found; otherwise process_weights_after_loading already ran
