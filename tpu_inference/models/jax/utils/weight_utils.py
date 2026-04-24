@@ -1220,27 +1220,30 @@ def parallel_load_non_moe_cache(
                 min(max_workers, len(tasks)))
 
     # Step 4: Process in parallel.
-    # Capture the mesh from the main thread — worker threads need it
-    # because jax.sharding.get_mesh() is context-local (thread-local).
+    # Capture the mesh from the main thread — worker threads don't
+    # inherit contextvars (jax.set_mesh uses contextvars internally).
+    # Instead of relying on context, extract weight_loader's reshape/
+    # permute args and call assign_and_shard_param with explicit mesh.
     mesh = get_mesh()
     loaded = 0
     errors = 0
 
     def _process(hf_name, tensor, param):
-        with jax.set_mesh(mesh):
-            wl = None
-            if hasattr(param, 'get_metadata'):
-                try:
-                    wl = param.get_metadata("weight_loader")
-                except KeyError:
-                    pass
-            if wl is not None:
-                wl(param, tensor)
-            else:
-                # Fallback: direct reshape+shard (2D → transpose, 1D → as-is)
-                jax_weight = jax_array_from_reshaped_torch(tensor)
-                assign_and_shard_param(param, jax_weight,
-                                       param_name=hf_name, mesh=mesh)
+        # Extract reshape/permute dims from weight_loader partial args
+        reshape_dims = None
+        permute_dims = None
+        if hasattr(param, 'get_metadata'):
+            try:
+                wl = param.get_metadata("weight_loader")
+                if wl is not None and hasattr(wl, 'keywords'):
+                    reshape_dims = wl.keywords.get('reshape_dims')
+                    permute_dims = wl.keywords.get('permute_dims')
+            except KeyError:
+                pass
+        jax_weight = jax_array_from_reshaped_torch(
+            tensor, reshape_dims=reshape_dims, permute_dims=permute_dims)
+        assign_and_shard_param(param, jax_weight,
+                               param_name=hf_name, mesh=mesh)
 
     t1 = time.perf_counter()
     with ThreadPoolExecutor(
