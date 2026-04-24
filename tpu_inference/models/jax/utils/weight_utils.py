@@ -1219,23 +1219,28 @@ def parallel_load_non_moe_cache(
                 len(tasks), skipped, len(unmatched),
                 min(max_workers, len(tasks)))
 
-    # Step 4: Process in parallel
+    # Step 4: Process in parallel.
+    # Capture the mesh from the main thread — worker threads need it
+    # because jax.sharding.get_mesh() is context-local (thread-local).
+    mesh = get_mesh()
     loaded = 0
     errors = 0
 
     def _process(hf_name, tensor, param):
-        wl = None
-        if hasattr(param, 'get_metadata'):
-            try:
-                wl = param.get_metadata("weight_loader")
-            except KeyError:
-                pass
-        if wl is not None:
-            wl(param, tensor)
-        else:
-            # Fallback: direct reshape+shard (2D → transpose, 1D → as-is)
-            jax_weight = jax_array_from_reshaped_torch(tensor)
-            assign_and_shard_param(param, jax_weight, param_name=hf_name)
+        with jax.set_mesh(mesh):
+            wl = None
+            if hasattr(param, 'get_metadata'):
+                try:
+                    wl = param.get_metadata("weight_loader")
+                except KeyError:
+                    pass
+            if wl is not None:
+                wl(param, tensor)
+            else:
+                # Fallback: direct reshape+shard (2D → transpose, 1D → as-is)
+                jax_weight = jax_array_from_reshaped_torch(tensor)
+                assign_and_shard_param(param, jax_weight,
+                                       param_name=hf_name, mesh=mesh)
 
     t1 = time.perf_counter()
     with ThreadPoolExecutor(
