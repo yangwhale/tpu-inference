@@ -1251,9 +1251,19 @@ def parallel_load_non_moe_cache(
             spec = spec.spec
         elif isinstance(spec, SingleDeviceSharding):
             spec = ()
+        # Debug: log first few params' sharding specs
+        if _process._debug_count < 5:
+            logger.info("[parallel non-MoE DEBUG] %s: spec=%s, "
+                        "metadata_keys=%s, shape=%s",
+                        hf_name, spec,
+                        list(metadata.keys()) if isinstance(metadata, dict)
+                        else type(metadata).__name__,
+                        jax_weight.shape)
+            _process._debug_count += 1
         param.value = shard_put(jax_weight, spec, mesh=mesh)
         param.set_metadata("_is_loaded", True)
         del jax_weight
+    _process._debug_count = 0
 
     t1 = time.perf_counter()
     with ThreadPoolExecutor(
