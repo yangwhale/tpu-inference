@@ -1242,28 +1242,12 @@ def parallel_load_non_moe_cache(
                 pass
         jax_weight = jax_array_from_reshaped_torch(
             tensor, reshape_dims=reshape_dims, permute_dims=permute_dims)
-        # Shard to TPU using the captured mesh — same logic as
-        # assign_and_shard_param but with explicit mesh to avoid
-        # picking up a stale mesh from param metadata.
-        metadata = param.get_metadata() if hasattr(param, 'get_metadata') else {}
-        spec = metadata.get("sharding", ())
-        if isinstance(spec, NamedSharding):
-            spec = spec.spec
-        elif isinstance(spec, SingleDeviceSharding):
-            spec = ()
-        # Debug: log first few params' sharding specs
-        if _process._debug_count < 5:
-            logger.info("[parallel non-MoE DEBUG] %s: spec=%s, "
-                        "metadata_keys=%s, shape=%s",
-                        hf_name, spec,
-                        list(metadata.keys()) if isinstance(metadata, dict)
-                        else type(metadata).__name__,
-                        jax_weight.shape)
-            _process._debug_count += 1
-        param.value = shard_put(jax_weight, spec, mesh=mesh)
-        param.set_metadata("_is_loaded", True)
-        del jax_weight
-    _process._debug_count = 0
+        # Use assign_and_shard_param which reads the correct mesh
+        # from param metadata (param stores its own mesh with proper
+        # axis names like 'model', 'expert'). The explicit mesh arg
+        # is only used as fallback if param has no mesh metadata.
+        assign_and_shard_param(param, jax_weight,
+                               param_name=hf_name, mesh=mesh)
 
     t1 = time.perf_counter()
     with ThreadPoolExecutor(
