@@ -1242,8 +1242,22 @@ def parallel_load_non_moe_cache(
                 pass
         jax_weight = jax_array_from_reshaped_torch(
             tensor, reshape_dims=reshape_dims, permute_dims=permute_dims)
-        assign_and_shard_param(param, jax_weight,
-                               param_name=hf_name, mesh=mesh)
+        # Directly shard to TPU using the captured mesh.
+        # Don't use assign_and_shard_param which may pick up a stale
+        # mesh from param metadata. Use shard_put with explicit mesh.
+        spec = ()
+        if hasattr(param, 'get_metadata'):
+            try:
+                spec = param.get_metadata("sharding")
+                if isinstance(spec, NamedSharding):
+                    spec = spec.spec
+                elif isinstance(spec, SingleDeviceSharding):
+                    spec = ()
+            except KeyError:
+                pass
+        param.value = shard_put(jax_weight, spec, mesh=mesh)
+        param.set_metadata("_is_loaded", True)
+        del jax_weight
 
     t1 = time.perf_counter()
     with ThreadPoolExecutor(
