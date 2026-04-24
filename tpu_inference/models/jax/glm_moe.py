@@ -1406,42 +1406,25 @@ class GlmMoeForCausalLM(JaxModule, LoadableWithIterator):
             return super().load_weights(weights)
 
         from tpu_inference import envs
+        from tpu_inference.models.jax.utils.weight_utils import (
+            _discover_cached_moe_layers,
+        )
         use_moe_cache = bool(envs.MOE_WEIGHT_CACHE_DIR)
         moe_cache_hit = False
 
         if use_moe_cache:
             model_path = self.vllm_config.model_config.model
-            # Check if cache exists at config-specific path.
-            # If yes → filter safetensors (fast path).
-            # If no → load all safetensors normally so requantization can
-            #          generate and save the cache (first-run path).
-            from tpu_inference.layers.jax.quantization.fp8 import (
-                _get_config_cache_subdir,
-            )
-            # Compute moe_backend the same way the model does.
-            moe_backend = select_moe_backend(
-                get_expert_parallelism(
-                    ShardingAxisName.MLP_TENSOR, self.mesh) > 1
-                and self.vllm_config.sharding_config.tp_size
-                    * self.vllm_config.sharding_config.attn_dp_size == 1
-            )
-            if moe_backend is not None:
-                config_subdir = _get_config_cache_subdir(
-                    moe_backend, self.mesh)
-                config_cache_dir = os.path.join(
-                    envs.MOE_WEIGHT_CACHE_DIR, config_subdir)
-                # Check for npy_v1 dirs or legacy .npz files
-                moe_cache_hit = (
-                    os.path.isdir(config_cache_dir)
-                    and any(
-                        os.path.isdir(os.path.join(config_cache_dir, f))
-                        or f.endswith('.npz')
-                        for f in os.listdir(config_cache_dir))
-                )
+            # Use _discover_cached_moe_layers() which scans all subdirs
+            # for valid cache (meta.json). This avoids the moe_backend
+            # recomputation bug where load_weights() and model init
+            # compute different config subdirs.
+            cached_layers = _discover_cached_moe_layers(
+                envs.MOE_WEIGHT_CACHE_DIR)
+            moe_cache_hit = bool(cached_layers)
             if moe_cache_hit:
                 logger.info(
-                    "[MoE cache] Cache found at %s, filtering safetensors",
-                    config_cache_dir)
+                    "[MoE cache] Found cache for %d layers, "
+                    "filtering safetensors", len(cached_layers))
                 weights = _filtered_safetensors_iterator(model_path)
             else:
                 logger.info(
