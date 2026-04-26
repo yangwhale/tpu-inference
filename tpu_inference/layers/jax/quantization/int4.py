@@ -361,7 +361,6 @@ def _cpu_process_int4_layer(
     tc0 = time.perf_counter()
     w13_np = np.concatenate([w_gate_np, w_up_np], axis=1)
     s13_np = np.concatenate([s_gate_np, s_up_np], axis=1)
-    del w_gate_np, w_up_np, s_gate_np, s_up_np
     tc1 = time.perf_counter()
     _t("C_fuse_w13", tc1 - tc0)
 
@@ -369,6 +368,9 @@ def _cpu_process_int4_layer(
     td0 = time.perf_counter()
 
     if moe_backend == MoEBackend.GMM_EP:
+        # GMM_TP fallback below still references w_gate_np / w_up_np /
+        # s_gate_np / s_up_np, so only del them once we have committed to GMM_EP.
+        del w_gate_np, w_up_np, s_gate_np, s_up_np
         # K2.6 v3 fast path: jnp swapaxes + with_layout_constraint = metadata-only
         # transpose (XLA optimizes, no actual memory copy).
         # Skip process_w13_for_gmm because for K2.6 (intermediate=2048 aligned to 128,
