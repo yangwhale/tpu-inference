@@ -22,8 +22,11 @@ from tpu_inference.layers.jax import JaxModule
 
 
 def get_tpu_quantization_config(vllm_config: VllmConfig):
-    from tpu_inference.layers.common.quant_methods import FP8
+    from tpu_inference.layers.common.quant_methods import (COMPRESSED_TENSORS,
+                                                           FP8)
     from tpu_inference.layers.jax.quantization.fp8 import Fp8Config
+    from tpu_inference.layers.jax.quantization.int4 import \
+        CompressedTensorsW4A16Config
     from tpu_inference.layers.jax.quantization.unquantized import \
         UnquantizedConfig
 
@@ -31,6 +34,7 @@ def get_tpu_quantization_config(vllm_config: VllmConfig):
     method_to_config: dict[str | None, type] = {
         None: UnquantizedConfig,
         FP8: Fp8Config,
+        COMPRESSED_TENSORS: CompressedTensorsW4A16Config,
     }
 
     if model_config.quantization not in method_to_config:
@@ -38,11 +42,21 @@ def get_tpu_quantization_config(vllm_config: VllmConfig):
             f"{model_config.quantization} quantization method not supported."
             f" Supported methods are {method_to_config.keys()}")
     quant_config = method_to_config[model_config.quantization]
+
+    # Find quantization_config: top-level first, then text_config (multimodal
+    # models like Kimi K2.6 nest it under text_config because the top-level
+    # arch is KimiK25ForConditionalGeneration).
     hg_quant_config = getattr(model_config.hf_config, "quantization_config",
-                              {})
+                              None)
+    if not hg_quant_config:
+        text_config = getattr(model_config.hf_config, "text_config", None)
+        if text_config is not None:
+            hg_quant_config = getattr(text_config, "quantization_config",
+                                      {}) or {}
+    hg_quant_config = hg_quant_config or {}
+
     # There are some cases to be supported in the future:
-    # 1) Some vision model keep quantization config under text_config
-    # 2) overriding through `--hf_overrides`
+    # 1) overriding through `--hf_overrides`
     return quant_config(hg_quant_config)
 
 

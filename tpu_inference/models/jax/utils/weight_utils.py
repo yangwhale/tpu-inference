@@ -707,7 +707,14 @@ def load_hf_weights(
                             f"(?={filter_regex})({moe_exclude})")
                     else:
                         filter_regex = moe_exclude
-        max_workers = min(64, len(weights_files))
+        # K2.6 INT4 / OOM fix: each layer's process_weights_after_loading
+        # creates ~75GB CPU staging (concat 384 expert + unpack + dequant +
+        # process_unquantized_moe_weights reorder). With 64 concurrent threads,
+        # 64 * 75GB = 4.8 TB which OOMs the 920GB pod. Default to 1 thread for
+        # large MoE models (override via LOADER_MAX_WORKERS env var if needed).
+        import os as _os
+        max_workers = int(_os.environ.get("LOADER_MAX_WORKERS",
+                                          min(64, len(weights_files))))
         # NOTE(xiang): Disable multi-threading mode if running on multi-host.
         # Because multi-threading would cause different JAX processes to load
         # different weights at the same time.
@@ -1007,9 +1014,17 @@ class JaxAutoWeightsLoader(AutoWeightsLoader):
                     reshape_dims = (N, H)
                     permute_dims = (0, 1)
                 elif "o_proj.weight" in name:
-                    N, H, D = param.value.shape
-                    reshape_dims = (D, N, H)
-                    permute_dims = (1, 2, 0)
+                    # Handle both 3D (Llama-style: N, H, D) and 2D
+                    # (Deepseek/GLM/Kimi-style: N*H, D) o_proj weights.
+                    if param.value.ndim == 3:
+                        N, H, D = param.value.shape
+                        reshape_dims = (D, N, H)
+                        permute_dims = (1, 2, 0)
+                    else:
+                        # 2D: shape (N*H, D), HF stores as (D, N*H), transpose
+                        out_dim, in_dim = param.value.shape
+                        reshape_dims = (in_dim, out_dim)
+                        permute_dims = (1, 0)
                 elif "embed_tokens.weight" in name:
                     permute_dims = (0, 1)
                 elif "lm_head" in name:
