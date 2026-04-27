@@ -733,44 +733,70 @@ class CompressedTensorsW4A16FusedMoEMethod(QuantizeMethodBase):
 
         t0 = time.perf_counter()
 
-        # Step 1: check all weights loaded
-        params_to_check = []
-        for proj in [
-                "kernel_gating_EDF", "kernel_up_proj_EDF",
-                "kernel_down_proj_EFD"
-        ]:
-            for suffix in ["weight_packed", "weight_scale"]:
-                params_to_check.append(getattr(layer, f"{proj}_{suffix}"))
+        # === v18 cache fast path: check BEFORE step 1's weight-loaded gate ===
+        # When MOE_WEIGHT_CACHE_DIR is set, _filtered_safetensors_iterator skips
+        # MoE expert keys (filter at safetensors level). This means
+        # _weights_to_load is all None, so the step-1 check below would
+        # return False and the V16 path never runs. Detect cache up front and
+        # short-circuit to the V16 mmap+make_array_from_callback path.
+        cache_root_early = os.environ.get("MOE_WEIGHT_CACHE_DIR", "")
+        cache_dir_early = ""
+        if cache_root_early and K26_USE_V16 and \
+                layer.moe_backend == MoEBackend.GMM_EP:
+            safe_prefix = layer.prefix.replace(".", "_").replace("/", "_")
+            cache_dir_early = os.path.join(cache_root_early, safe_prefix)
+            if not os.path.exists(
+                    os.path.join(cache_dir_early, "meta.json")):
+                cache_dir_early = ""
 
-        if any(any(w is None for w in p._weights_to_load)
-               for p in params_to_check):
-            return False
+        if not cache_dir_early:
+            # Step 1: check all weights loaded (only meaningful when cache miss)
+            params_to_check = []
+            for proj in [
+                    "kernel_gating_EDF", "kernel_up_proj_EDF",
+                    "kernel_down_proj_EFD"
+            ]:
+                for suffix in ["weight_packed", "weight_scale"]:
+                    params_to_check.append(
+                        getattr(layer, f"{proj}_{suffix}"))
+
+            if any(any(w is None for w in p._weights_to_load)
+                   for p in params_to_check):
+                return False
 
         t_check = time.perf_counter()
 
-        # Step 2: snapshot per-expert weight lists from nnx.Param
-        packed_lists = {
-            "gate": list(layer.kernel_gating_EDF_weight_packed._weights_to_load),
-            "up": list(layer.kernel_up_proj_EDF_weight_packed._weights_to_load),
-            "down": list(layer.kernel_down_proj_EFD_weight_packed._weights_to_load),
-        }
-        scale_lists = {
-            "gate": list(layer.kernel_gating_EDF_weight_scale._weights_to_load),
-            "up": list(layer.kernel_up_proj_EDF_weight_scale._weights_to_load),
-            "down": list(layer.kernel_down_proj_EFD_weight_scale._weights_to_load),
-        }
+        if not cache_dir_early:
+            # Step 2: snapshot per-expert weight lists from nnx.Param
+            packed_lists = {
+                "gate": list(layer.kernel_gating_EDF_weight_packed._weights_to_load),
+                "up": list(layer.kernel_up_proj_EDF_weight_packed._weights_to_load),
+                "down": list(layer.kernel_down_proj_EFD_weight_packed._weights_to_load),
+            }
+            scale_lists = {
+                "gate": list(layer.kernel_gating_EDF_weight_scale._weights_to_load),
+                "up": list(layer.kernel_up_proj_EDF_weight_scale._weights_to_load),
+                "down": list(layer.kernel_down_proj_EFD_weight_scale._weights_to_load),
+            }
+        else:
+            # Cache hit — empty packed_lists/scale_lists (V16 path will mmap)
+            packed_lists = {"gate": [], "up": [], "down": []}
+            scale_lists = {"gate": [], "up": [], "down": []}
         t_snap = time.perf_counter()
 
         # Step 3: free intermediate per-expert Params ASAP
-        del layer.kernel_gating_EDF_weight_packed
-        del layer.kernel_gating_EDF_weight_scale
-        del layer.kernel_up_proj_EDF_weight_packed
-        del layer.kernel_up_proj_EDF_weight_scale
-        del layer.kernel_down_proj_EFD_weight_packed
-        del layer.kernel_down_proj_EFD_weight_scale
-        del layer.kernel_gating_EDF
-        del layer.kernel_up_proj_EDF
-        del layer.kernel_down_proj_EFD
+        # delattr always (whether cache hit or miss) to free graph slots
+        for attr in ("kernel_gating_EDF_weight_packed",
+                     "kernel_gating_EDF_weight_scale",
+                     "kernel_up_proj_EDF_weight_packed",
+                     "kernel_up_proj_EDF_weight_scale",
+                     "kernel_down_proj_EFD_weight_packed",
+                     "kernel_down_proj_EFD_weight_scale",
+                     "kernel_gating_EDF",
+                     "kernel_up_proj_EDF",
+                     "kernel_down_proj_EFD"):
+            if hasattr(layer, attr):
+                delattr(layer, attr)
         t_del = time.perf_counter()
 
         # Step 4: CPU work (or cache hit). Phase 3: try cache first.
@@ -782,24 +808,67 @@ class CompressedTensorsW4A16FusedMoEMethod(QuantizeMethodBase):
         if K26_USE_V16 and layer.moe_backend == MoEBackend.GMM_EP:
             from jax.sharding import NamedSharding
             t_v16_0 = time.perf_counter()
-            # K2.6 per-expert weight is shape [1, F, D/8] uint32 (1 = leading expert dim)
-            # Use np.concatenate axis=0 to merge 384 experts directly: [E=384, F, D/8]
-            w_gate_np = np.concatenate([np.asarray(p) for p in packed_lists["gate"]], axis=0)
-            w_up_np = np.concatenate([np.asarray(p) for p in packed_lists["up"]], axis=0)
-            w_down_np = np.concatenate([np.asarray(p) for p in packed_lists["down"]], axis=0)
-            t_v16_1 = time.perf_counter()
-            # fuse w13 axis=1 (F dim): [E, 2*F, D/8]
-            w13_packed_np = np.concatenate([w_gate_np, w_up_np], axis=1)
-            del w_gate_np, w_up_np
-            # scale: same pattern [E, 2*F, D/group] bf16
-            s_gate_np = np.concatenate([np.asarray(s) for s in scale_lists["gate"]], axis=0)
-            s_up_np = np.concatenate([np.asarray(s) for s in scale_lists["up"]], axis=0)
-            s_down_np = np.concatenate([np.asarray(s) for s in scale_lists["down"]], axis=0)
-            s13_np = np.concatenate([s_gate_np, s_up_np], axis=1)
-            del s_gate_np, s_up_np
-            print('[v16-DEBUG] post-fuse w13_packed_np.shape={}, w_down_np.shape={}, s13_np.shape={}, s_down_np.shape={}'.format(
-                w13_packed_np.shape, w_down_np.shape, s13_np.shape, s_down_np.shape))
-            t_v16_2 = time.perf_counter()
+
+            # === v18 cache fast path: mmap pre-built fused weight ===
+            # Cache built offline by scripts/build_k26_moe_cache.py:
+            #   $MOE_WEIGHT_CACHE_DIR/{prefix}_mlp_experts/
+            #     w13_weight_packed.npy  uint32  [E, 2F, D/8]   (gate+up fused)
+            #     w13_weight_scale.npy   |V2     [E, 2F, D/G]   (bf16 raw bytes)
+            #     w2_weight_packed.npy   uint32  [E, D, F/8]
+            #     w2_weight_scale.npy    |V2     [E, D, F/G]
+            #     meta.json
+            # Hit -> skip 384-expert numpy iter + concat (~3-5 s/layer saved).
+            cache_root = os.environ.get("MOE_WEIGHT_CACHE_DIR", "")
+            cache_dir_v18 = ""
+            if cache_root:
+                # layer.prefix is e.g. "model.layers.1.mlp.experts" (already
+                # includes ".mlp.experts"). Just dot/slash -> underscore.
+                safe_prefix = layer.prefix.replace(".", "_").replace("/", "_")
+                cache_dir_v18 = os.path.join(cache_root, safe_prefix)
+                meta_p = os.path.join(cache_dir_v18, "meta.json")
+                meta_exists = os.path.exists(meta_p)
+                print(f"[v18-cache-DEBUG] prefix={layer.prefix!r} "
+                      f"cache_root={cache_root!r} cache_dir_v18={cache_dir_v18!r} "
+                      f"meta_exists={meta_exists}")
+                if not meta_exists:
+                    cache_dir_v18 = ""
+
+            if cache_dir_v18:
+                import ml_dtypes
+                w13_packed_np = np.load(
+                    f"{cache_dir_v18}/w13_weight_packed.npy", mmap_mode="r")
+                w_down_np = np.load(
+                    f"{cache_dir_v18}/w2_weight_packed.npy", mmap_mode="r")
+                s13_raw = np.load(
+                    f"{cache_dir_v18}/w13_weight_scale.npy", mmap_mode="r")
+                s_down_raw = np.load(
+                    f"{cache_dir_v18}/w2_weight_scale.npy", mmap_mode="r")
+                s13_np = s13_raw.view(ml_dtypes.bfloat16)
+                s_down_np = s_down_raw.view(ml_dtypes.bfloat16)
+                t_v16_1 = time.perf_counter()
+                t_v16_2 = t_v16_1
+                print(f"[v18-cache-hit] {layer.prefix} mmap "
+                      f"in {(t_v16_1-t_v16_0)*1000:.1f}ms "
+                      f"w13={w13_packed_np.shape} w2={w_down_np.shape}")
+            else:
+                # K2.6 per-expert weight is shape [1, F, D/8] uint32 (1 = leading expert dim)
+                # Use np.concatenate axis=0 to merge 384 experts directly: [E=384, F, D/8]
+                w_gate_np = np.concatenate([np.asarray(p) for p in packed_lists["gate"]], axis=0)
+                w_up_np = np.concatenate([np.asarray(p) for p in packed_lists["up"]], axis=0)
+                w_down_np = np.concatenate([np.asarray(p) for p in packed_lists["down"]], axis=0)
+                t_v16_1 = time.perf_counter()
+                # fuse w13 axis=1 (F dim): [E, 2*F, D/8]
+                w13_packed_np = np.concatenate([w_gate_np, w_up_np], axis=1)
+                del w_gate_np, w_up_np
+                # scale: same pattern [E, 2*F, D/group] bf16
+                s_gate_np = np.concatenate([np.asarray(s) for s in scale_lists["gate"]], axis=0)
+                s_up_np = np.concatenate([np.asarray(s) for s in scale_lists["up"]], axis=0)
+                s_down_np = np.concatenate([np.asarray(s) for s in scale_lists["down"]], axis=0)
+                s13_np = np.concatenate([s_gate_np, s_up_np], axis=1)
+                del s_gate_np, s_up_np
+                print('[v16-DEBUG] post-fuse w13_packed_np.shape={}, w_down_np.shape={}, s13_np.shape={}, s_down_np.shape={}'.format(
+                    w13_packed_np.shape, w_down_np.shape, s13_np.shape, s_down_np.shape))
+                t_v16_2 = time.perf_counter()
             # device_put to HBM with sharding (E shard via ATTN_DATA_EXPERT axis)
             w13_sharding = NamedSharding(layer.mesh, P(layer.edf_sharding[0], None, None))
             w2_sharding = NamedSharding(layer.mesh, P(layer.efd_sharding[0], None, None))
@@ -807,33 +876,75 @@ class CompressedTensorsW4A16FusedMoEMethod(QuantizeMethodBase):
             s2_sharding_v16 = NamedSharding(layer.mesh, P(layer.efd_sharding[0], None, None))
             # v17 actual: device_put uint32, then bitcast+reshape+transpose ON HBM
             # Goal: store int4 dtype with [E, D, 2F] (matches v14 layout, fused_moe_func happy)
-            w13_uint32_hbm = jax.device_put(w13_packed_np, w13_sharding)
-            # bitcast as UNSIGNED uint4 (matches storage), then -8 to recover signed int4 [-8, 7]
-            # (v14 path: low/high nibble extract + `out -= 8`. v17 must mirror this offset.)
-            w13_uint4_raw = jax.lax.bitcast_convert_type(w13_uint32_hbm, jnp.uint4)  # [E, 2F, D/8, 8] uint4
-            E_l = w13_uint4_raw.shape[0]
-            two_F = w13_uint4_raw.shape[1]
-            D_p8 = w13_uint4_raw.shape[2]
-            w13_uint4_FD = w13_uint4_raw.reshape(E_l, two_F, D_p8 * 8)  # [E, 2F, D]
-            w13_int4_FD = (w13_uint4_FD.astype(jnp.int8) - 8).astype(jnp.int4)  # signed [-8, 7]
-            w13_int8_reordered = jnp.transpose(w13_int4_FD, (0, 2, 1))  # [E, D, 2F] int4
-            # v14-equivalent: force XLA to materialize transpose (else lazy view, fused_moe_func sees source layout)
-            w13_int8_reordered = with_layout_constraint(w13_int8_reordered, Layout((0, 1, 2)))
-            del w13_uint32_hbm, w13_uint4_raw, w13_uint4_FD, w13_int4_FD
+            #
+            # v18 cache hit path: jax.device_put(mmap_arr) makes XLA see the full
+            # array as input -> compile-time HBM analysis multiplies by ranks
+            # -> OOM. Use make_array_from_callback instead so each device only
+            # loads its own slice (zero-copy via mmap). See fp8.py:1078 pattern.
+            if cache_dir_v18:
+                # v18 cache: shape is ALREADY [E, D, 2F/8] uint32 (pre-transposed offline)
+                # Runtime skips numpy concat AND TPU transpose + layout_constraint.
+                w13_uint32_hbm = jax.make_array_from_callback(
+                    w13_packed_np.shape, w13_sharding,
+                    lambda index: w13_packed_np[index])
+                w13_uint4_raw = jax.lax.bitcast_convert_type(
+                    w13_uint32_hbm, jnp.uint4)  # [E, D, 2F/8, 8] uint4
+                E_l, D_l, two_F_p8 = w13_uint4_raw.shape[:3]
+                w13_uint4_DF = w13_uint4_raw.reshape(
+                    E_l, D_l, two_F_p8 * 8)  # [E, D, 2F]
+                w13_int8_reordered = (
+                    w13_uint4_DF.astype(jnp.int8) - 8).astype(jnp.int4)
+                del w13_uint32_hbm, w13_uint4_raw, w13_uint4_DF
+            else:
+                w13_uint32_hbm = jax.device_put(w13_packed_np, w13_sharding)
+                # bitcast as UNSIGNED uint4 (matches storage), then -8 to recover signed int4 [-8, 7]
+                # (v14 path: low/high nibble extract + `out -= 8`. v17 must mirror this offset.)
+                w13_uint4_raw = jax.lax.bitcast_convert_type(w13_uint32_hbm, jnp.uint4)  # [E, 2F, D/8, 8] uint4
+                E_l = w13_uint4_raw.shape[0]
+                two_F = w13_uint4_raw.shape[1]
+                D_p8 = w13_uint4_raw.shape[2]
+                w13_uint4_FD = w13_uint4_raw.reshape(E_l, two_F, D_p8 * 8)  # [E, 2F, D]
+                w13_int4_FD = (w13_uint4_FD.astype(jnp.int8) - 8).astype(jnp.int4)  # signed [-8, 7]
+                w13_int8_reordered = jnp.transpose(w13_int4_FD, (0, 2, 1))  # [E, D, 2F] int4
+                # v14-equivalent: force XLA to materialize transpose (else lazy view, fused_moe_func sees source layout)
+                w13_int8_reordered = with_layout_constraint(w13_int8_reordered, Layout((0, 1, 2)))
+                del w13_uint32_hbm, w13_uint4_raw, w13_uint4_FD, w13_int4_FD
 
-            w2_uint32_hbm = jax.device_put(w_down_np, w2_sharding)
-            w2_uint4_raw = jax.lax.bitcast_convert_type(w2_uint32_hbm, jnp.uint4)  # [E, D, F/8, 8] uint4
-            E_l2 = w2_uint4_raw.shape[0]
-            D_dim = w2_uint4_raw.shape[1]
-            F_p8 = w2_uint4_raw.shape[2]
-            w2_uint4_DF = w2_uint4_raw.reshape(E_l2, D_dim, F_p8 * 8)  # [E, D, F]
-            w2_int4_DF = (w2_uint4_DF.astype(jnp.int8) - 8).astype(jnp.int4)  # signed [-8, 7]
-            w_down_int8_reordered = jnp.transpose(w2_int4_DF, (0, 2, 1))  # [E, F, D] int4
-            w_down_int8_reordered = with_layout_constraint(w_down_int8_reordered, Layout((0, 1, 2)))
-            del w2_uint32_hbm, w2_uint4_raw, w2_uint4_DF, w2_int4_DF
+            if cache_dir_v18:
+                # v18 cache: shape is ALREADY [E, F, D/8] uint32 (pre-transposed)
+                w2_uint32_hbm = jax.make_array_from_callback(
+                    w_down_np.shape, w2_sharding,
+                    lambda index: w_down_np[index])
+                w2_uint4_raw = jax.lax.bitcast_convert_type(
+                    w2_uint32_hbm, jnp.uint4)  # [E, F, D/8, 8] uint4
+                E_l2, F_dim, D_p8 = w2_uint4_raw.shape[:3]
+                w2_uint4_FD = w2_uint4_raw.reshape(
+                    E_l2, F_dim, D_p8 * 8)  # [E, F, D]
+                w_down_int8_reordered = (
+                    w2_uint4_FD.astype(jnp.int8) - 8).astype(jnp.int4)
+                del w2_uint32_hbm, w2_uint4_raw, w2_uint4_FD
+            else:
+                w2_uint32_hbm = jax.device_put(w_down_np, w2_sharding)
+                w2_uint4_raw = jax.lax.bitcast_convert_type(w2_uint32_hbm, jnp.uint4)  # [E, D, F/8, 8] uint4
+                E_l2 = w2_uint4_raw.shape[0]
+                D_dim = w2_uint4_raw.shape[1]
+                F_p8 = w2_uint4_raw.shape[2]
+                w2_uint4_DF = w2_uint4_raw.reshape(E_l2, D_dim, F_p8 * 8)  # [E, D, F]
+                w2_int4_DF = (w2_uint4_DF.astype(jnp.int8) - 8).astype(jnp.int4)  # signed [-8, 7]
+                w_down_int8_reordered = jnp.transpose(w2_int4_DF, (0, 2, 1))  # [E, F, D] int4
+                w_down_int8_reordered = with_layout_constraint(w_down_int8_reordered, Layout((0, 1, 2)))
+                del w2_uint32_hbm, w2_uint4_raw, w2_uint4_DF, w2_int4_DF
 
-            s13_reordered = jax.device_put(s13_np, s13_sharding_v16)
-            s_down_reordered = jax.device_put(s_down_np, s2_sharding_v16)
+            if cache_dir_v18:
+                s13_reordered = jax.make_array_from_callback(
+                    s13_np.shape, s13_sharding_v16,
+                    lambda index: s13_np[index])
+                s_down_reordered = jax.make_array_from_callback(
+                    s_down_np.shape, s2_sharding_v16,
+                    lambda index: s_down_np[index])
+            else:
+                s13_reordered = jax.device_put(s13_np, s13_sharding_v16)
+                s_down_reordered = jax.device_put(s_down_np, s2_sharding_v16)
             jax.block_until_ready(w13_int8_reordered)
             jax.block_until_ready(w_down_int8_reordered)
             jax.block_until_ready(s13_reordered)
