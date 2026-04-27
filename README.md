@@ -72,6 +72,133 @@ Visit our [documentation](https://docs.vllm.ai/projects/tpu/en/latest/) to learn
 
 <br>
 
+## Kimi K2.6 (671B MoE+MLA) Multi-Host on TPU v7x-16
+
+This branch (`feature/kimi-k26-multihost-v18`) contains a fix for running
+Kimi K2.6 W4A16 INT4 inference across multiple TPU v7x hosts (16 chips,
+2x2x2 topology). Tested on GKE with `LeaderWorkerSet` and Ray distributed
+executor.
+
+### Key fixes in this branch
+
+**1. `int4.py` — Fix `UnboundLocalError` in GMM_TP fallback**
+
+`_cpu_process_int4_layer` deleted `w_gate_np` / `w_up_np` / `s_gate_np` /
+`s_up_np` immediately after concatenating them into `w13_np` / `s13_np`,
+but the GMM_TP fallback path (which is selected for K2.6 multi-host with
+MLA + DP attention) still references those split arrays. The `del` is
+now deferred into the GMM_EP branch so the fast path still frees memory
+early while the fallback works.
+
+**2. Required `additional_config` for proper EP backend**
+
+When `enable_dp_attention=True`, `sharding.py` re-routes the
+`expert_parallelism` dimension to `attn_dp_expert`. K2.6 reads its expert
+mesh size from `ShardingAxisName.ATTN_DATA_EXPERT`, so without an
+explicit `expert_parallelism` value the mesh ends up with
+`attn_dp_expert=1` and `use_ep=False`. The model then falls back to
+`MoEBackend.GMM_TP`, which (a) skips the V16 packed-int4 fast path and
+(b) is ~16x slower for weight load. The fix is to pin `tensor_parallelism`
+to 1 and set `expert_parallelism` to the chip count in
+`additional_config`:
+
+```json
+{
+  "sharding": {
+    "sharding_strategy": {
+      "enable_dp_attention": true,
+      "tensor_parallelism": 1,
+      "expert_parallelism": 16
+    }
+  }
+}
+```
+
+This produces a mesh of `(data=1, attn_dp=1, attn_dp_expert=16, expert=1, model=1)`.
+Attention parallelism is unchanged (it shards along the
+`(data, attn_dp, attn_dp_expert)` axis tuple, total 16 either way), but
+K2.6 now correctly identifies EP=16 and selects `MoEBackend.GMM_EP` with
+the V16 fast path.
+
+### Required environment variables
+
+```bash
+export NEW_MODEL_DESIGN=1     # MLA models require this; vllm errors out otherwise
+export K26_USE_V16=1          # Enables packed uint32 -> int4 bitcast in HBM
+export MODEL_IMPL_TYPE=flax_nnx
+export TPU_BACKEND_TYPE=jax
+export PJRT_DEVICE=TPU
+export USE_MOE_EP_KERNEL=0    # K2.6 W4A16 uses GMM kernels, not fused MoE
+export USE_BATCHED_RPA_KERNEL=0
+export VLLM_XLA_CHECK_RECOMPILATION=0
+export SKIP_JAX_PRECOMPILE=1
+```
+
+### vLLM serve flags
+
+```bash
+vllm serve /path/to/Kimi-K2.6 \
+  --served-model-name=Kimi-K2.6 \
+  --tensor-parallel-size=16 \
+  --distributed-executor-backend=ray \
+  --max-model-len=8192 \
+  --max-num-batched-tokens=8192 \
+  --max-num-seqs=64 \
+  --no-enable-prefix-caching \
+  --gpu-memory-utilization=0.85 \
+  --enable-expert-parallel \
+  --trust-remote-code \
+  --enforce-eager \
+  --limit-mm-per-prompt='{"image":0,"video":0}' \
+  --additional_config '{"sharding": {"sharding_strategy": {"enable_dp_attention": true, "tensor_parallelism": 1, "expert_parallelism": 16}}}' \
+  --host=0.0.0.0 --port=8000
+```
+
+### Multi-host topology requirements
+
+- 2 hosts × 4 TPU v7x chips each (2x2x2 topology, 16 chips total)
+- Both hosts must mount the same shared filesystem (e.g., a `ReadWriteMany`
+  PVC) so `tpu_inference` source and model weights are byte-identical
+- Ray cluster: leader runs `ray start --head --port=6379 --resources='{"TPU": 4}'`,
+  worker runs `ray start --address=<leader-ip>:6379 --resources='{"TPU": 4}' --block`
+- TPU multi-host environment must be set on both pods before Python starts:
+  `TPU_WORKER_HOSTNAMES`, `TPU_WORKER_ID`, `TPU_PROCESS_ADDRESSES`,
+  `TPU_HOST_BOUNDS=1,1,2`, `TPU_CHIPS_PER_HOST_BOUNDS=2,2,1`,
+  `TPU_TOPOLOGY=2x2x2`, `TPU_ACCELERATOR_TYPE=tpu7x-16`
+
+### Smoke test
+
+After `Application startup complete.` appears in the leader log
+(typically ~55 minutes for 64 weight shards), the server should respond
+to standard OpenAI-compatible completion requests:
+
+```bash
+curl -X POST http://<leader-ip>:8000/v1/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"Kimi-K2.6","prompt":"2 + 3 = ","max_tokens":10,"temperature":0}'
+```
+
+A passing run produces coherent text. A failed quantization path
+produces repeated nonsense tokens (e.g., `"foss foss foss..."`).
+
+### Known characteristics
+
+- **Cold start ~57 minutes**: dominated by safetensors I/O (~54 s per
+  shard × 64 shards). Weight load can be sped up substantially by
+  pre-warming the page cache on a local SSD (e.g., `/lssd`) before pod
+  start, or by increasing `LOADER_MAX_WORKERS` if I/O bandwidth is
+  underutilized.
+- **`enforce-eager` is required** for the current branch. XLA compile
+  with full graph capture has not been validated yet.
+- **Single-host sanity tests with low layer counts can hide bugs**:
+  K2.6 has at least 3 dense layers at the start of the model, so a 4-layer
+  test with `--hf-overrides='{"num_hidden_layers":4}'` may not exercise
+  the MoE quantization path at all. Validate any quantization patch
+  against multi-host + a model config that includes at least one MoE
+  layer.
+
+<br>
+
 ## TPU Support Matrix Dashboard
 
 Below is the live status of our supported models, features, and kernels. Click on any category to expand the detailed support table. It is automatically updated from our detailed [Support Matrices](https://github.com/vllm-project/tpu-inference/tree/main/support_matrices).
