@@ -65,3 +65,17 @@ else:
         logger.error(
             f"Error occurred while logging TPU info: {e}. Are you running on CPU?"
         )
+
+# Register custom model config types with transformers so that
+# AutoConfig.from_pretrained() can recognize them before model class import.
+try:
+    from transformers import AutoConfig
+    from transformers.models.deepseek_v3.configuration_deepseek_v3 import \
+        DeepseekV3Config
+
+    class GlmMoeDsaConfig(DeepseekV3Config):
+        model_type = "glm_moe_dsa"
+
+    AutoConfig.register("glm_moe_dsa", GlmMoeDsaConfig)
+except Exception:
+    pass  # Non-fatal: transformers version may not have DeepseekV3Config

@@ -43,6 +43,8 @@ if TYPE_CHECKING:
     REGISTER_MM_MODULE_CUSTOM_PYTREE_CLASSES: list[str] = []
     RAGGED_GATED_DELTA_RULE_IMPL: str = "ragged_gated_delta_rule_chunked"
     MOE_ALL_GATHER_ACTIVATION_DTYPE: str = ""
+    MOE_WEIGHT_CACHE_DIR: str | None = None
+    MOE_PARALLEL_WORKERS: int = 1
 
 
 def env_with_choices(
@@ -253,6 +255,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
                      ]),
     "MOE_ALL_GATHER_ACTIVATION_DTYPE":
     lambda: os.getenv("MOE_ALL_GATHER_ACTIVATION_DTYPE", ""),
+    # Directory to cache requantized MoE weights. When set, processed FP4
+    # weights are saved after the first requantization and loaded directly
+    # on subsequent startups, skipping the expensive CPU requantization.
+    "MOE_WEIGHT_CACHE_DIR":
+    lambda: os.getenv("MOE_WEIGHT_CACHE_DIR", None),
+    # Number of parallel workers for MoE weight requantization.
+    # Default 1 (serial). Set higher (e.g., 4-10) to parallelize
+    # across MoE layers, reducing first-startup requantization time.
+    "MOE_PARALLEL_WORKERS":
+    lambda: int(os.getenv("MOE_PARALLEL_WORKERS", "1")),
 }
 
 

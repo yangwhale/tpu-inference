@@ -54,7 +54,8 @@ from tpu_inference.layers.jax.moe.utils import (get_expert_parallelism,
 from tpu_inference.layers.jax.norm import JaxRmsNorm
 from tpu_inference.layers.jax.pp_utils import PPMissingLayer, make_layers
 from tpu_inference.layers.jax.quantization.configs import QuantizationConfig
-from tpu_inference.layers.jax.rope import DeepseekScalingRotaryEmbedding
+from tpu_inference.layers.jax.rope import (DeepseekScalingRotaryEmbedding,
+                                           InterleavedRotaryEmbedding)
 from tpu_inference.logger import init_logger
 from tpu_inference.models.jax.jax_intermediate_tensor import \
     JaxIntermediateTensors
@@ -68,6 +69,7 @@ KVCache = Tuple[jax.Array, jax.Array]
 
 logger = init_logger(__name__)
 
+# Register kimi_k25 config type with transformers (K2.6 has same architecture as K2.5).
 
 def _weight_init(random_init: bool):
     return sharded_initializer if random_init else nnx.initializers.uniform()
@@ -75,33 +77,31 @@ def _weight_init(random_init: bool):
 
 modeling_flax_utils = FlaxUtils()
 
+# Kimi K2.6 1T MoE model configuration.
+# Based on moonshotai/Kimi-K2.6 config.json (verified 2026-04-25, see plan v0.4.3).
+# K2.6 actually reuses DeepseekV3ForCausalLM model class via text_config.architectures.
 # TODO: read these configs from HF config.
-num_local_experts: int = 256
-vocab_size: int = 129280
+num_local_experts: int = 384
+vocab_size: int = 163840
 hidden_size: int = 7168
-num_attention_heads: int = 128
-num_key_value_heads: int = 128
-ffw_intermediate_size: int = 18432
+num_attention_heads: int = 64
+num_key_value_heads: int = 64
+ffw_intermediate_size: int = 18432  # intermediate_size (dense MLP, layer 0 only) in HF config
 moe_intermediate_size: int = 2048
 num_experts_per_token: int = 8
-n_group: int = 8
-interleave_moe_layer_step: int = 1  # Deepseek V3 has moe_layer_freq=1 in hf config.
+n_group: int = 1  # no group routing
+topk_group: int = 1  # no group routing
+interleave_moe_layer_step: int = 1  # moe_layer_freq=1 in HF config
 hidden_act: str = "silu"
-rms_norm_eps: float = 1e-06
-routed_scaling_factor: float = 2.5
-first_k_dense_replace: int = 3  # replace the first few MOE layers to dense layer.
+rms_norm_eps: float = 1e-05
+routed_scaling_factor: float = 2.827
+first_k_dense_replace: int = 1  # K2.6: only layer 0 is dense MLP, layers 1-60 are MoE
 
 num_shared_experts = 1
-rope_theta = 10000
-rope_scaling = {
-    "beta_fast": 32,
-    "beta_slow": 1,
-    "factor": 40,
-    "mscale": 1.0,
-    "mscale_all_dim": 1.0,
-    "original_max_position_embeddings": 4096,
-    "type": "yarn"
-}
+rope_theta = 50000.0
+# K2.6 uses YaRN RoPE (factor=64, original_max_position=4096 → 256K context).
+# RoPE adaptation deferred to Round 4 (current code still inherits GLM-5.1's InterleavedRotaryEmbedding,
+# which uses standard RoPE without YaRN — must be replaced with YaRN for K2.6's 256K context).
 q_lora_rank = 1536
 kv_lora_rank = 512
 qk_nope_head_dim = 128
@@ -111,9 +111,9 @@ expert_axis_name = ShardingAxisName.ATTN_DATA_EXPERT
 
 
 @dataclass(kw_only=True)
-class DeepseekV3BaseAttention(JaxModule):
+class KimiK26BaseAttention(JaxModule):
     """
-    Base class containing shared logic for DeepSeek Attention mechanisms.
+    Base class containing shared logic for Kimi K2.6 MLA Attention mechanisms.
     Handles initialization of common layers and defines skeleton forward pass.
     """
     # Core configuration
@@ -167,6 +167,10 @@ class DeepseekV3BaseAttention(JaxModule):
         self.D = self.hidden_size
         self.qk_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
 
+        # Kimi K2.6 uses YaRN RoPE (factor=64). Same mscale formula as DeepSeek V3.
+        # When scaling_factor > 1, attention output magnitude needs adjustment to
+        # preserve numerical stability with extended context.
+        # Reference: deepseek_v3.py:170-176
         if self.rope.scaling_factor <= 1.0:
             yarn_mscale = 1.0
         else:
@@ -315,7 +319,7 @@ class DeepseekV3BaseAttention(JaxModule):
 
 
 @dataclass(kw_only=True)
-class DeepseekV3Attention(DeepseekV3BaseAttention):
+class KimiK26Attention(KimiK26BaseAttention):
     """Standard Multi-Head Attention (MHA) for DeepSeek models."""
 
     def __post_init__(self, rngs: nnx.Rngs):
@@ -522,15 +526,30 @@ class MLAEinsum(JaxEinsum):
             self.loaded.add(name)
         if len(self.loaded) != len(named_params):
             return
-        assert self.quant_config is not None
-        # After loading, split the weights into k/v
+        # After loading, split the weights into k/v.
+        # K2.6: attention is unquantized (BF16), so self.weight is already BF16,
+        # no fp8 dequant needed (no weight_scale_inv).
+        # GLM-5.1 fp8: needs fp8 dequant via weight_scale_inv.
+        is_unquantized = not hasattr(self, "weight_scale_inv")
         with cpu_mesh_context():
-            dequantized_weight = dequantize_tensor(
-                self.weight,
-                self.weight_scale_inv,
-                (0, 1),
-                block_size=None,
-            ).T
+            if is_unquantized:
+                # Pure BF16 path: weight is already in target dtype.
+                # JaxEinsum kernel_shape was created as (A, N*head_dim), and
+                # vLLM weight loader keeps the same orientation since we don't
+                # set transpose permute_dims for kv_b_proj. So no transpose
+                # needed (unlike fp8 path where dequantize_tensor returns
+                # transposed result and needs .T to flip back).
+                w_cpu = jax.device_put(self.weight.value, jax.devices('cpu')[0])
+                dequantized_weight = w_cpu
+            else:
+                # FP8 path: dequant via scale_inv (GLM-5.1)
+                assert self.quant_config is not None
+                dequantized_weight = dequantize_tensor(
+                    self.weight,
+                    self.weight_scale_inv,
+                    (0, 1),
+                    block_size=None,
+                ).T
             A, N, qk_nope_head_dim, v_head_dim = self.mla_layer.kv_lora_rank, self.mla_layer.N, self.mla_layer.qk_nope_head_dim, self.mla_layer.v_head_dim
             if dequantized_weight.shape != (A, N *
                                             (qk_nope_head_dim + v_head_dim)):
@@ -541,16 +560,23 @@ class MLAEinsum(JaxEinsum):
                 A, N, qk_nope_head_dim + v_head_dim)
             k_ANH, v_ANH = jnp.split(dequantized_weight, [qk_nope_head_dim],
                                      axis=-1)
-            k_ANH_weight, k_ANH_scale = quantize_tensor(k_ANH,
-                                                        self.weight.dtype,
-                                                        dim=-1)
-            v_ANH_weight, v_1NH_scale = quantize_tensor(v_ANH,
-                                                        self.weight.dtype,
-                                                        dim=0)
-            # As of writing, sharded_quantized_batched_matmul expects scale to be
-            # a different shape order than weight
-            k_N1A_scale = k_ANH_scale.transpose(1, 2, 0)
-            v_N1H_scale = v_1NH_scale.transpose(1, 0, 2)
+            if is_unquantized:
+                # No quantize back — just keep BF16
+                k_ANH_weight = k_ANH
+                v_ANH_weight = v_ANH
+                k_N1A_scale = None
+                v_N1H_scale = None
+            else:
+                k_ANH_weight, k_ANH_scale = quantize_tensor(k_ANH,
+                                                            self.weight.dtype,
+                                                            dim=-1)
+                v_ANH_weight, v_1NH_scale = quantize_tensor(v_ANH,
+                                                            self.weight.dtype,
+                                                            dim=0)
+                # As of writing, sharded_quantized_batched_matmul expects scale to be
+                # a different shape order than weight
+                k_N1A_scale = k_ANH_scale.transpose(1, 2, 0)
+                v_N1H_scale = v_1NH_scale.transpose(1, 0, 2)
         mla_layer = self.mla_layer
         setattr(
             mla_layer, "k_up_proj",
@@ -573,18 +599,23 @@ class MLAEinsum(JaxEinsum):
         # Cannot apply anh_sharding to scales, otherwise it complains about shape mismatch.
         mla_layer.k_up_proj.weight.value = shard_put(
             k_ANH_weight, self.mla_layer.anh_sharding)
-        mla_layer.k_up_proj.weight_scale_inv.value = shard_put(k_N1A_scale, ())
         mla_layer.v_up_proj.weight.value = shard_put(
             v_ANH_weight, self.mla_layer.anh_sharding)
-        mla_layer.v_up_proj.weight_scale_inv.value = shard_put(v_N1H_scale, ())
+        if not is_unquantized:
+            mla_layer.k_up_proj.weight_scale_inv.value = shard_put(
+                k_N1A_scale, ())
+            mla_layer.v_up_proj.weight_scale_inv.value = shard_put(
+                v_N1H_scale, ())
 
         delattr(self, 'weight')
-        delattr(self, 'weight_scale_inv')
-        delattr(self, 'quant_method')
+        if not is_unquantized:
+            delattr(self, 'weight_scale_inv')
+        if hasattr(self, 'quant_method'):
+            delattr(self, 'quant_method')
 
 
 @dataclass(kw_only=True)
-class DeepseekV3MLA(DeepseekV3BaseAttention):
+class KimiK26MLA(KimiK26BaseAttention):
     """Multi-Head Latent Attention (MLA) for DeepSeek V3."""
     anh_sharding: Sharding = ()
 
@@ -730,7 +761,7 @@ class DeepseekV3MLA(DeepseekV3BaseAttention):
 
 
 @dataclass(kw_only=True)
-class DeepseekV3MLP(JaxModule):
+class KimiK26MLP(JaxModule):
     """A Gated Feed-Forward Network (FFN) layer.
 
     This module consists of two linear projections (gating and up-projection),
@@ -807,14 +838,14 @@ class DeepseekV3MLP(JaxModule):
 
 
 @dataclass(kw_only=True)
-class SharedFusedMoe(JaxMoE):
+class KimiK26FusedMoe(JaxMoE):
     """
-    Corresponds to vLLM's SharedFusedMoe.
+    Corresponds to vLLM's KimiK26FusedMoe.
     Handles the routed and shared experts + the relevant forward pass.
 
     Reference here: https://github.com/vllm-project/vllm/blob/168ee03e1cbba2b962adbc704b16762b266be184/vllm/model_executor/layers/fused_moe/shared_fused_moe.py#L14
     """
-    shared_experts: Optional[DeepseekV3MLP] = None
+    shared_experts: Optional[KimiK26MLP] = None
 
     routed_scaling_factor: float = 1.0
 
@@ -831,11 +862,8 @@ class SharedFusedMoe(JaxMoE):
         return final_hidden_states
 
 
-class DeepseekV2Moe(JaxModule):
-    """Jax implementation of Deepseek MoE layer
-    
-    vllm ref. https://github.com/vllm-project/vllm/blob/168ee03e1cbba2b962adbc704b16762b266be184/vllm/model_executor/models/deepseek_v2.py#L225
-    """
+class KimiK26Layer(JaxModule):
+    """Jax implementation of Kimi K2.6 MoE layer (same structure as DeepSeek V3)."""
 
     def __init__(self,
                  *,
@@ -848,12 +876,12 @@ class DeepseekV2Moe(JaxModule):
                  rng,
                  prefix: str = ""):
 
-        self.gate = DeepSeekV3Router(
+        self.gate = KimiK26Router(
             hidden_size=hidden_size,
             num_experts=num_local_experts,
             num_experts_per_tok=num_experts_per_token,
             n_groups=n_group,
-            topk_groups=4,
+            topk_groups=topk_group,
             norm_topk_prob=True,
             rngs=rng,
             routed_scaling_factor=routed_scaling_factor,
@@ -866,7 +894,7 @@ class DeepseekV2Moe(JaxModule):
             quant_config=quant_config)
 
         # shared experts
-        self.shared_experts = DeepseekV3MLP(
+        self.shared_experts = KimiK26MLP(
             dtype=dtype,
             hidden_act=hidden_act,
             hidden_size=hidden_size,
@@ -894,7 +922,7 @@ class DeepseekV2Moe(JaxModule):
             moe_edf_sharding = P(ShardingAxisName.ATTN_DATA_EXPERT, None, None)
             moe_efd_sharding = P(ShardingAxisName.ATTN_DATA_EXPERT, None, None)
 
-        self.experts = SharedFusedMoe(
+        self.experts = KimiK26FusedMoe(
             dtype=dtype,
             num_local_experts=num_local_experts,
             apply_expert_weight_before_computation=False,
@@ -913,7 +941,7 @@ class DeepseekV2Moe(JaxModule):
             efd_sharding=moe_efd_sharding,
             moe_backend=moe_backend,
             qwix_quantized_weight_dtype=None,
-            # It's abnormal prefix here because we are using dataclass for SharedFusedMoe and JaxMoe.
+            # It's abnormal prefix here because we are using dataclass for KimiK26FusedMoe and JaxMoe.
             # The proper way is to change both to normal class, set prefix=prefix+".mlp" here,
             # then in __init__, pass prefix+".experts" to super().__init__.
             prefix=f"{prefix}.experts",
@@ -926,19 +954,19 @@ class DeepseekV2Moe(JaxModule):
         return self.experts(x_TD)
 
 
-class DeepseekV3DecoderLayer(JaxModule):
+class KimiK26DecoderLayer(JaxModule):
     """
-    Implementats the DecoderLayer for DeepseekV3.
+    Implements the DecoderLayer for Kimi K2.6 MoE.
     """
 
     def __init__(
             self,
             input_layernorm: JaxRmsNorm,
             post_attention_layernorm: JaxRmsNorm,
-            self_attn: Union[DeepseekV3Attention, DeepseekV3MLA],
+            self_attn: Union[KimiK26Attention, KimiK26MLA],
 
-            # MLP can be either the Dense MLP (for first k layers) or SharedFusedMoe
-            mlp: nnx.Module | SharedFusedMoe | DeepseekV3MLP,
+            # MLP can be either the Dense MLP (for first k layers) or KimiK26FusedMoe
+            mlp: nnx.Module | KimiK26FusedMoe | KimiK26MLP,
             prefix: str = ""):
         self.input_layernorm = input_layernorm
         self.post_attention_layernorm = post_attention_layernorm
@@ -968,7 +996,7 @@ class DeepseekV3DecoderLayer(JaxModule):
         return new_cache, hidden_states
 
 
-class DeepSeekV3Router(JaxEinsum):
+class KimiK26Router(JaxEinsum):
     """Router module for Mixture-of-Experts (MoE) layers.
 
     This module determines which experts each token should be routed to based on the input.
@@ -1108,7 +1136,7 @@ class DeepSeekV3Router(JaxEinsum):
 
 
 @dataclass
-class DeepSeekV3(JaxModule):
+class KimiK26Model(JaxModule):
 
     def __init__(self,
                  vllm_config: VllmConfig,
@@ -1120,7 +1148,7 @@ class DeepSeekV3(JaxModule):
 
         self.use_mla_kernel: bool = self.vllm_config.model_config.use_mla
 
-        logger.info(f"Is using MLA kernel in DeepSeek: {self.use_mla_kernel}")
+        logger.info(f"Is using MLA kernel in Kimi K2.6: {self.use_mla_kernel}")
 
         self.mesh = mesh
 
@@ -1140,7 +1168,11 @@ class DeepSeekV3(JaxModule):
 
         self.is_first_rank = get_pp_group().is_first_rank
         self.is_last_rank = get_pp_group().is_last_rank
-        hf_config = vllm_config.model_config.hf_config
+        # K2.6 is a multimodal wrapper (KimiK25ForConditionalGeneration).
+        # All language model config (hidden_size, num_layers, rope_*, etc.) lives
+        # under text_config. Use it if present.
+        hf_config_raw = vllm_config.model_config.hf_config
+        hf_config = getattr(hf_config_raw, "text_config", None) or hf_config_raw
         dtype = vllm_config.model_config.dtype
         scoring_func = getattr(hf_config, "scoring_func", "sigmoid")
 
@@ -1159,21 +1191,24 @@ class DeepSeekV3(JaxModule):
         else:
             self.embed_tokens = PPMissingLayer()
 
+        # K2.6 RoPE: YaRN with factor=64, original_max_position=4096 → 256K context.
+        # Pull rope_scaling from text_config (multimodal), fall back to defaults.
+        rope_scaling = getattr(hf_config, "rope_scaling", None) or {}
         self.rope_emb = DeepseekScalingRotaryEmbedding(
             rotary_dim=qk_rope_head_dim,
-            rope_theta=rope_theta,
-            original_max_position_embeddings=rope_scaling[
-                "original_max_position_embeddings"],
-            scaling_factor=rope_scaling["factor"],
+            rope_theta=getattr(hf_config, "rope_theta", rope_theta),
+            original_max_position_embeddings=rope_scaling.get(
+                "original_max_position_embeddings", 4096),
+            scaling_factor=rope_scaling.get("factor", 64.0),
             dtype=dtype,
-            beta_fast=rope_scaling["beta_fast"],
-            beta_slow=rope_scaling["beta_slow"],
-            mscale_value=rope_scaling["mscale"],
-            mscale_all_dim=rope_scaling["mscale_all_dim"],
+            beta_fast=rope_scaling.get("beta_fast", 32),
+            beta_slow=rope_scaling.get("beta_slow", 1),
+            mscale_value=rope_scaling.get("mscale", 1.0),
+            mscale_all_dim=rope_scaling.get("mscale_all_dim", 1.0),
         )
 
         def _create_deepseek_attention(
-                i: int) -> Union[DeepseekV3MLA, DeepseekV3Attention]:
+                i: int) -> Union[KimiK26MLA, KimiK26Attention]:
             if self.use_mla_kernel:
                 query_tnh_spec = P(ShardingAxisName.ATTN_DATA, None, None)
                 keyvalue_skh_spec = P(ShardingAxisName.ATTN_DATA, None)
@@ -1190,9 +1225,9 @@ class DeepSeekV3(JaxModule):
 
             attn_cls = None
             if self.use_mla_kernel:
-                attn_cls = DeepseekV3MLA
+                attn_cls = KimiK26MLA
             else:
-                attn_cls = DeepseekV3Attention
+                attn_cls = KimiK26Attention
                 assert num_attention_heads == num_key_value_heads, "Expected same number of of attention heads and key value heads for MHA."
 
             kwargs = dict(
@@ -1209,7 +1244,7 @@ class DeepSeekV3(JaxModule):
                 if self.use_mla_kernel else num_key_value_heads,
                 head_dim=v_head_dim,  # MLA uses v_head_dim as head_dim
                 rope=self.rope_emb,
-                rope_mscale_all_dim=rope_scaling["mscale_all_dim"],
+                rope_mscale_all_dim=0,
                 dtype=dtype,
                 # TODO (jacobplatin): we should refactor this to pass a dtype (or config) directly
                 kv_cache_dtype=vllm_config.cache_config.cache_dtype,
@@ -1265,7 +1300,7 @@ class DeepSeekV3(JaxModule):
 
             if not is_moe_layer:
                 # Dense Layer (used for first k layers or interleaved dense layers)
-                mlp_layer = DeepseekV3MLP(
+                mlp_layer = KimiK26MLP(
                     dtype=dtype,
                     hidden_act=hidden_act,
                     hidden_size=hidden_size,
@@ -1277,7 +1312,7 @@ class DeepSeekV3(JaxModule):
                     quant_config=quant_config)
             else:
                 # MoE Layer
-                mlp_layer = DeepseekV2Moe(
+                mlp_layer = KimiK26Layer(
                     mesh=self.mesh,
                     dtype=dtype,
                     num_expert_parallelism=self.num_expert_parallelism,
@@ -1287,14 +1322,14 @@ class DeepSeekV3(JaxModule):
                     rng=rng,
                     prefix=f"{prefix}.layers.{layer_index}.mlp")
 
-            return DeepseekV3DecoderLayer(
+            return KimiK26DecoderLayer(
                 input_layernorm=input_layernorm,
                 post_attention_layernorm=post_attention_layernorm,
                 self_attn=_create_deepseek_attention(layer_index),
                 mlp=mlp_layer,
                 prefix=f"{prefix}.layers.{layer_index}")
 
-        # hf_config.num_hidden_layers is 61, which ignores the last MTP layer.
+        # Kimi K2.6: num_hidden_layers=78 (standard layers 0-77), MTP layer 78 is separate.
         self.start_layer, self.end_layer, self.layers = make_layers(
             hf_config.num_hidden_layers, get_decoder_layer)
 
@@ -1346,7 +1381,7 @@ class DeepSeekV3(JaxModule):
         return kv_caches, x
 
 
-class DeepseekV3ForCausalLM(JaxModule, LoadableWithIterator):
+class KimiK26ForCausalLM(JaxModule, LoadableWithIterator):
 
     def __init__(self, vllm_config: VllmConfig, rng_key: jax.Array,
                  mesh: Mesh) -> None:
@@ -1354,7 +1389,7 @@ class DeepseekV3ForCausalLM(JaxModule, LoadableWithIterator):
         rng = nnx.Rngs(rng_key)
         self.mesh = mesh
 
-        self.model = DeepSeekV3(
+        self.model = KimiK26Model(
             vllm_config=vllm_config,
             rng=rng,
             mesh=mesh,
@@ -1375,7 +1410,7 @@ class DeepseekV3ForCausalLM(JaxModule, LoadableWithIterator):
                 kernel_init=nnx.with_partitioning(
                     init_fn, (None, ShardingAxisName.MLP_TENSOR)),
                 # Same as https://github.com/vllm-project/tpu-inference/issues/1684
-                # DS-V3 doesn't quantize lm_head.
+                # Kimi K2.6 doesn't quantize lm_head.
                 quant_config=None,
                 prefix="lm_head",
             )
@@ -1416,48 +1451,47 @@ class DeepseekV3ForCausalLM(JaxModule, LoadableWithIterator):
     def compute_logits(self, hidden_states: jax.Array) -> jax.Array:
         return self.lm_head(hidden_states)
 
+    @staticmethod
+    def _strip_kimi_k26_prefix(weights: Iterable) -> Iterable:
+        """K2.6 是 multimodal wrapper（KimiK25ForConditionalGeneration），
+        所有语言模型权重以 'language_model.' 开头，需要 strip 掉再传给 loader。
+        同时 skip vision_tower / mm_projector（vision encoder Phase 3，暂不支持）。
+
+        Round 2 (2026-04-25)：只 strip + skip，不处理 INT4 unpack（Round 3）。
+        """
+        for key, weight in weights:
+            if key.startswith("vision_tower.") or key.startswith(
+                    "mm_projector."):
+                continue
+            if key.startswith("language_model."):
+                key = key[len("language_model."):]
+            yield key, weight
+
     def load_weights(self, weights: Iterable) -> set[str]:
         if not isinstance(weights, Iterable):
             # Use next parent class in MRO.
             return super().load_weights(weights)
 
         from tpu_inference import envs
+        from tpu_inference.models.jax.utils.weight_utils import (
+            _discover_cached_moe_layers,
+        )
         use_moe_cache = bool(envs.MOE_WEIGHT_CACHE_DIR)
         moe_cache_hit = False
 
         if use_moe_cache:
             model_path = self.vllm_config.model_config.model
-            # Check if cache exists at config-specific path.
-            # If yes → filter safetensors (fast path).
-            # If no → load all safetensors normally so requantization can
-            #          generate and save the cache (first-run path).
-            from tpu_inference.layers.jax.quantization.fp8 import (
-                _get_config_cache_subdir,
-            )
-            # Compute moe_backend the same way the model does.
-            moe_backend = select_moe_backend(
-                get_expert_parallelism(
-                    ShardingAxisName.MLP_TENSOR, self.mesh) > 1
-                and self.vllm_config.sharding_config.tp_size
-                    * self.vllm_config.sharding_config.attn_dp_size == 1
-            )
-            if moe_backend is not None:
-                config_subdir = _get_config_cache_subdir(
-                    moe_backend, self.mesh)
-                config_cache_dir = os.path.join(
-                    envs.MOE_WEIGHT_CACHE_DIR, config_subdir)
-                # Check for npy_v1 dirs or legacy .npz files
-                moe_cache_hit = (
-                    os.path.isdir(config_cache_dir)
-                    and any(
-                        os.path.isdir(os.path.join(config_cache_dir, f))
-                        or f.endswith('.npz')
-                        for f in os.listdir(config_cache_dir))
-                )
+            # Use _discover_cached_moe_layers() which scans all subdirs
+            # for valid cache (meta.json). This avoids the moe_backend
+            # recomputation bug where load_weights() and model init
+            # compute different config subdirs.
+            cached_layers = _discover_cached_moe_layers(
+                envs.MOE_WEIGHT_CACHE_DIR)
+            moe_cache_hit = bool(cached_layers)
             if moe_cache_hit:
                 logger.info(
-                    "[MoE cache] Cache found at %s, filtering safetensors",
-                    config_cache_dir)
+                    "[MoE cache] Found cache for %d layers, "
+                    "filtering safetensors", len(cached_layers))
                 weights = _filtered_safetensors_iterator(model_path)
             else:
                 logger.info(
@@ -1465,15 +1499,27 @@ class DeepseekV3ForCausalLM(JaxModule, LoadableWithIterator):
                     "for requantization")
 
         start_ignore_layer_num = len(self.model.layers)
-        end_ignore_layer_num = 62  # last layer is MTP, we ignore it for now
+        # K2.6: max 61 transformer layers, no MTP (num_nextn_predict_layers=0).
+        # Upper bound 62 is safe (includes the rare case of layers.61 metadata).
+        end_ignore_layer_num = 62
+        skip_substrs = [
+            f"layers.{i}"
+            for i in range(start_ignore_layer_num, end_ignore_layer_num)
+        ]
+        # Skip DSA indexer weights (K2.6 doesn't use DSA, but inherited from GLM-5.1 plumbing)
+        skip_substrs += ["indexer"]
+        skip_prefixes = ["lm_head"] if not hasattr(self, 'lm_head') else []
+        # Inherited from GLM-5.1: MTP-specific top-level weights
+        # (K2.6 has no MTP, but skip them defensively in case checkpoint includes them)
+        skip_prefixes += ["eh_proj", "enorm", "hnorm", "shared_head"]
+
+        # K2.6: strip 'language_model.' prefix + skip vision_tower / mm_projector
+        weights = self._strip_kimi_k26_prefix(weights)
+
         loader = JaxAutoWeightsLoader(
             self,
-            skip_prefixes=(["lm_head"]
-                           if not hasattr(self, 'lm_head') else []),
-            skip_substrs=[
-                f"layers.{i}"
-                for i in range(start_ignore_layer_num, end_ignore_layer_num)
-            ],
+            skip_prefixes=skip_prefixes,
+            skip_substrs=skip_substrs,
         )
         loaded = loader.load_weights(weights)
 

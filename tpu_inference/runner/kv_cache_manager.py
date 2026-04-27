@@ -684,8 +684,11 @@ class KVCacheManager:
                     if j == 0 or duplicate_shared_layers:
                         # NOTE: we'll multiply the num_kv_heads by 2 in the function
                         if self.use_mla:
-                            head_size = self.runner.model_config.hf_config.kv_lora_rank + \
-                                self.runner.model_config.hf_config.qk_rope_head_dim
+                            # K2.6 multimodal fallback: kv_lora_rank lives in text_config.
+                            _hf = self.runner.model_config.hf_config
+                            _hf = getattr(_hf, "text_config", None) or _hf
+                            head_size = _hf.kv_lora_rank + \
+                                _hf.qk_rope_head_dim
                         else:
                             head_size = layer_spec.head_size
                         kv_cache = create_kv_caches(
