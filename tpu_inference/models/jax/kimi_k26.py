@@ -531,6 +531,14 @@ class MLAEinsum(JaxEinsum):
         # no fp8 dequant needed (no weight_scale_inv).
         # GLM-5.1 fp8: needs fp8 dequant via weight_scale_inv.
         is_unquantized = not hasattr(self, "weight_scale_inv")
+        # v14 multi-host fix: gather cross-process shards BEFORE cpu_mesh_context.
+        # cpu_mesh_context sets jit's thread-local mesh to CPU device 0, which
+        # is incompatible with TPU-sharded input inside process_allgather's jit.
+        if is_unquantized and jax.process_count() > 1:
+            from jax.experimental import multihost_utils
+            weight_full = multihost_utils.process_allgather(self.weight.value, tiled=True)
+        else:
+            weight_full = None
         with cpu_mesh_context():
             if is_unquantized:
                 # Pure BF16 path: weight is already in target dtype.
@@ -539,7 +547,10 @@ class MLAEinsum(JaxEinsum):
                 # set transpose permute_dims for kv_b_proj. So no transpose
                 # needed (unlike fp8 path where dequantize_tensor returns
                 # transposed result and needs .T to flip back).
-                w_cpu = jax.device_put(self.weight.value, jax.devices('cpu')[0])
+                if jax.process_count() > 1:
+                    w_cpu = jax.device_put(weight_full, jax.devices('cpu')[0])
+                else:
+                    w_cpu = jax.device_put(self.weight.value, jax.devices('cpu')[0])
                 dequantized_weight = w_cpu
             else:
                 # FP8 path: dequant via scale_inv (GLM-5.1)
