@@ -76,6 +76,10 @@ try:
     class GlmMoeDsaConfig(DeepseekV3Config):
         model_type = "glm_moe_dsa"
 
+    class DeepseekV32Config(DeepseekV3Config):
+        model_type = "deepseek_v32"
+
     AutoConfig.register("glm_moe_dsa", GlmMoeDsaConfig)
+    AutoConfig.register("deepseek_v32", DeepseekV32Config)
 except Exception:
     pass  # Non-fatal: transformers version may not have DeepseekV3Config

@@ -55,7 +55,8 @@ _VLLM_PREFERRED_ARCHITECTURES: frozenset[str] = frozenset({
 
 # List of architectures that don't have pipeline parallelism support in jax yet.
 _PP_DISABLED_MODELS: frozenset[str] = frozenset(
-    {"DeepseekV3ForCausalLM", "GlmMoeDsaForCausalLM", "Eagle3LlamaForCausalLM",
+    {"DeepseekV3ForCausalLM", "DeepseekV32ForCausalLM",
+     "GlmMoeDsaForCausalLM", "Eagle3LlamaForCausalLM",
      "GptOssForCausalLM", "KimiK25ForConditionalGeneration"})
 
 
@@ -85,6 +86,7 @@ def _get_model_architecture(config: PretrainedConfig) -> nnx.Module:
     from tpu_inference.models.jax.qwen3_moe import Qwen3MoeForCausalLM
     _MODEL_REGISTRY["Llama4ForCausalLM"] = Llama4ForCausalLM
     _MODEL_REGISTRY["DeepseekV3ForCausalLM"] = DeepseekV3ForCausalLM
+    _MODEL_REGISTRY["DeepseekV32ForCausalLM"] = DeepseekV3ForCausalLM
     _MODEL_REGISTRY["GlmMoeDsaForCausalLM"] = GlmMoeForCausalLM
     # Kimi K2.6 / K2.5 (multimodal wrapper, language model = DeepseekV3)
     _MODEL_REGISTRY["KimiK25ForConditionalGeneration"] = KimiK26ForCausalLM
