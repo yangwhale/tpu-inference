@@ -941,7 +941,7 @@ def assign_and_shard_param(jax_param: nnx.Param,
         jax_param.value = shard_put(jax_weight, spec, mesh=param_mesh)
         jax_param.set_metadata("_is_loaded", True)
         del jax_weight
-        jax.clear_caches()
+#         jax.clear_caches()
     except Exception as e:
         raise RuntimeError(
             f"Failed to load weight '{param_name}' with shape {shape} into param with shape {jax_param.value.shape}"
@@ -1061,7 +1061,7 @@ class JaxAutoWeightsLoader(AutoWeightsLoader):
         if (quant_method := getattr(module, 'quant_method', None)) is not None:
             assert isinstance(quant_method, QuantizeMethodBase)
             loaded = quant_method.process_weights_after_loading(module)
-            jax.clear_caches()
+#             jax.clear_caches()
             assert isinstance(loaded, bool)
             self._process_weights_after_loading_per_module[
                 base_prefix] = loaded
@@ -1117,9 +1117,9 @@ def _load_moe_from_cache(model: "nnx.Module") -> None:
                 else:
                     generated += 1
             if loaded % 10 == 0:
-                jax.clear_caches()
+                    pass  # jax.clear_caches() disabled
     if loaded:
-        jax.clear_caches()
+#         jax.clear_caches()
         elapsed = time.time() - t_start
         logger.info("[MoE cache] Done: %d layers in %.1fs "
                     "(%d cached, %d generated)",
