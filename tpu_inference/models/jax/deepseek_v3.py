@@ -1470,7 +1470,7 @@ class DeepseekV3ForCausalLM(JaxModule, LoadableWithIterator):
             self,
             skip_prefixes=(["lm_head"]
                            if not hasattr(self, 'lm_head') else []),
-            skip_substrs=[
+            skip_substrs=["indexer"] + [
                 f"layers.{i}"
                 for i in range(start_ignore_layer_num, end_ignore_layer_num)
             ],
