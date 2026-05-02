@@ -391,8 +391,11 @@ class DeepseekV3BaseAttention(JaxModule):
         with jax.named_scope("kv_proj"):
             kv_data = self.compute_kv_projection(x_SD, md.input_positions)
 
+        _disable_dsa = (os.environ.get("DISABLE_DSA", "0") == "1"
+                        or os.path.exists("/tmp/DISABLE_DSA"))
         is_dsa_active = (
-            hasattr(self, 'indexer') and self.indexer is not None
+            not _disable_dsa
+            and hasattr(self, 'indexer') and self.indexer is not None
             and q_compressed is not None and indexer_cache is not None
         )
         num_tokens = x_SD.shape[0]
