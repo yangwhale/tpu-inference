@@ -140,16 +140,20 @@ def _scheduler_worker_process(
 ):
     """Worker process that manages a single scheduler instance."""
     # Initialize the scheduler in this process
-    scheduler = original_scheduler_cls(
+    import inspect
+    _init_params = inspect.signature(original_scheduler_cls.__init__).parameters
+    _kwargs = dict(
         vllm_config=vllm_config,
         kv_cache_config=kv_cache_config,
         structured_output_manager=structured_output_manager,
         block_size=block_size,
-        hash_block_size=hash_block_size,
         mm_registry=mm_registry,
         include_finished_set=include_finished_set,
         log_stats=log_stats,
     )
+    if 'hash_block_size' in _init_params:
+        _kwargs['hash_block_size'] = hash_block_size
+    scheduler = original_scheduler_cls(**_kwargs)
 
     _cached_scheduler_outputs: deque[SchedulerOutput] = deque()
 
@@ -311,6 +315,13 @@ class DPSchedulerOutput(SchedulerOutput):
         self.assigned_dp_rank = assigned_dp_rank or {}
         self.max_num_scheduled_tokens_per_dp_rank = max_num_scheduled_tokens_per_dp_rank
         self.req_ids_per_rank = req_ids_per_rank or {}
+
+    @property
+    def scheduled_tokens_per_rank(self):
+        return {
+            rank: [self.num_scheduled_tokens[rid] for rid in req_ids]
+            for rank, req_ids in self.req_ids_per_rank.items()
+        }
 
 
 class DPScheduler(SchedulerInterface):

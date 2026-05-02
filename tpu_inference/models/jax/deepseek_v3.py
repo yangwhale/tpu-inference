@@ -51,6 +51,7 @@ from tpu_inference.layers.jax.linear import JaxEinsum
 from tpu_inference.layers.jax.moe.moe import JaxMoE
 from tpu_inference.layers.jax.moe.utils import (get_expert_parallelism,
                                                 select_moe_backend)
+from tpu_inference.layers.jax.attention.indexer import DSAIndexer
 from tpu_inference.layers.jax.norm import JaxRmsNorm
 from tpu_inference.layers.jax.pp_utils import PPMissingLayer, make_layers
 from tpu_inference.layers.jax.quantization.configs import QuantizationConfig
@@ -292,10 +293,27 @@ class DeepseekV3BaseAttention(JaxModule):
         x_q_TD = lax.with_sharding_constraint(x, self.activation_q_td)
 
         with jax.named_scope("q_proj"):
-            q_data = self.compute_q_projection(x_q_TD, md.input_positions)
+            q_result = self.compute_q_projection(x_q_TD, md.input_positions)
+            if len(q_result) > 2:
+                q_data = (q_result[0], q_result[1])
+                q_compressed = q_result[2]
+            else:
+                q_data = q_result
+                q_compressed = None
 
         with jax.named_scope("kv_proj"):
             kv_data = self.compute_kv_projection(x_SD, md.input_positions)
+
+        if hasattr(self, 'indexer') and self.indexer is not None and q_compressed is not None:
+            with jax.named_scope("dsa_indexer"):
+                topk_indices, indexer_score = self.indexer(
+                    x_SD, q_compressed, md.input_positions, self.rope
+                )
+                if topk_indices is not None:
+                    jax.debug.print(
+                        "DSA Indexer: seq_len={sl}, topk shape={ts}",
+                        sl=x_SD.shape[0], ts=topk_indices.shape
+                    )
 
         with jax.named_scope("attn_op"):
             new_kv_cache, outputs_TNH = self.compute_attention(
@@ -605,6 +623,23 @@ class DeepseekV3MLA(DeepseekV3BaseAttention):
             prefix=self.prefix + ".kv_b_proj",
         )
 
+        # DSA (Dynamic Sparse Attention) Indexer — V3.2 only
+        indexer_n_heads = 64
+        indexer_head_dim = 128
+        indexer_topk = 2048
+        self.indexer = DSAIndexer(
+            n_heads=indexer_n_heads,
+            head_dim=indexer_head_dim,
+            q_lora_rank=self.q_lora_rank,
+            emb_dim=self.D,
+            qk_rope_head_dim=self.qk_rope_head_dim,
+            topk=indexer_topk,
+            dtype=self.dtype,
+            quant_config=self.quant_config,
+            prefix=self.prefix + ".indexer",
+            rngs=rngs,
+        )
+
     def compute_q_projection(
             self, x_q_TD: jax.Array,
             input_positions: jax.Array) -> Tuple[jax.Array, jax.Array]:
@@ -631,7 +666,7 @@ class DeepseekV3MLA(DeepseekV3BaseAttention):
         q_TNA = self.k_up_proj(q_nope_TNH)
 
         q_TNA = lax.with_sharding_constraint(q_TNA, self.query_tnh)
-        return (q_TNA, q_rope_TNH)
+        return (q_TNA, q_rope_TNH, q_TA)
 
     def compute_kv_projection(
             self, x_SD: jax.Array,
@@ -1487,7 +1522,7 @@ class DeepseekV3ForCausalLM(JaxModule, LoadableWithIterator):
             self,
             skip_prefixes=(["lm_head"]
                            if not hasattr(self, 'lm_head') else []),
-            skip_substrs=["indexer"] + [
+            skip_substrs=[
                 f"layers.{i}"
                 for i in range(start_ignore_layer_num, end_ignore_layer_num)
             ],

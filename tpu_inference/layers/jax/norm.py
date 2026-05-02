@@ -63,3 +63,18 @@ class JaxRmsNorm(nnx.RMSNorm, JaxModule):
         if self.quant_method is None:
             return nnx.RMSNorm.__call__(self, x, mask=mask)
         return self.quant_method.apply_jax(self, x, mask=mask)
+
+
+class JaxLayerNorm(nnx.LayerNorm, JaxModule):
+    """LayerNorm layer for JAX with HF-compatible parameter naming."""
+
+    def __init__(self, *args, prefix: str = "", **kwargs):
+        if "dtype" in kwargs and "param_dtype" not in kwargs:
+            kwargs["param_dtype"] = kwargs.pop("dtype")
+        nnx.LayerNorm.__init__(self, *args, **kwargs)
+        self.weight = self.scale
+        delattr(self, 'scale')
+
+    def __getattr__(self, name: str):
+        if name == "scale":
+            return self.weight
