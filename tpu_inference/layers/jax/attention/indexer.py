@@ -119,44 +119,70 @@ class DSAIndexer(JaxModule):
         x_pe = rope.apply_rope(positions, x_pe)
         return jnp.concatenate([x_pe, x_nope], axis=-1)
 
-    def __call__(
+    def compute_k(
         self,
         hidden_states: jax.Array,
+        positions: jax.Array,
+        rope: RotaryEmbedding,
+    ) -> jax.Array:
+        """Compute indexer K for given tokens (for cache storage).
+
+        Args:
+            hidden_states: [T, D] — layer input.
+            positions: [T] — token positions.
+            rope: RotaryEmbedding instance.
+
+        Returns:
+            [T, head_dim] — projected + normed + RoPE'd K.
+        """
+        k = self.wk(hidden_states)  # [T, head_dim]
+        k = self.k_norm(k)
+        k = k[:, None, :]  # [T, 1, head_dim] — add head dim for partial_rope
+        k = self._apply_partial_rope(k, positions, rope)
+        k = k[:, 0, :]  # [T, head_dim] — remove head dim
+        return k
+
+    def _compute_q(
+        self,
         q_compressed: jax.Array,
         positions: jax.Array,
         rope: RotaryEmbedding,
-    ) -> Tuple[Optional[jax.Array], Optional[jax.Array]]:
-        """Compute top-K KV indices for sparse attention.
+    ) -> jax.Array:
+        """Compute indexer Q from compressed query.
 
         Args:
-            hidden_states: [T, D] — current layer input.
-            q_compressed: [T, q_lora_rank] — compressed query (after q_a_layernorm).
+            q_compressed: [T, q_lora_rank] — compressed query.
             positions: [T] — token positions.
-            rope: RotaryEmbedding instance for partial RoPE.
+            rope: RotaryEmbedding instance.
 
         Returns:
-            (topk_indices, indexer_score) or (None, None) if seq_len <= topk.
-            topk_indices: [T, topk] — selected KV position indices.
-            indexer_score: [T, S] — per-position relevance scores.
+            [T, n_heads, head_dim] — projected + RoPE'd Q.
         """
-        seq_len = hidden_states.shape[0]
-
-        if seq_len <= self.topk:
-            return None, None
-
-        # Q: project from compressed query, reshape to [T, H, D], apply partial RoPE
-        q = self.wq_b(q_compressed)  # [T, H*D]
+        seq_len = q_compressed.shape[0]
+        q = self.wq_b(q_compressed)  # [T, n_heads * head_dim]
         q = q.reshape(seq_len, self.n_heads, self.head_dim)  # [T, H, D]
         q = self._apply_partial_rope(q, positions, rope)
+        return q
 
-        # K: project from hidden states, normalize, apply partial RoPE
-        k = self.wk(hidden_states)  # [T, D]
-        k = self.k_norm(k)
-        k = k[:, None, :]  # [T, 1, D] — add head dim for partial_rope
-        k = self._apply_partial_rope(k, positions, rope)
-        k = k[:, 0, :]  # [T, D] — remove head dim
+    def _score_and_topk(
+        self,
+        q: jax.Array,
+        k: jax.Array,
+        hidden_states: jax.Array,
+    ) -> Tuple[jax.Array, jax.Array]:
+        """Score Q against K and select top-K indices.
 
-        # QK similarity: relu(Q @ K.T), MQA-style (K shared across heads)
+        Args:
+            q: [T, n_heads, head_dim] — indexer Q.
+            k: [S, head_dim] — indexer K (all history).
+            hidden_states: [T, D] — for weights_proj (head importance).
+
+        Returns:
+            (topk_indices, indexer_score):
+                topk_indices: [T, topk]
+                indexer_score: [T, S]
+        """
+        # QK similarity: relu(Q @ K.T), MQA-style
         logits = jnp.einsum("THD,SD->TSH", q, k)  # [T, S, H]
         logits = jax.nn.relu(logits)
 
@@ -164,11 +190,95 @@ class DSAIndexer(JaxModule):
         weights = self.weights_proj(hidden_states.astype(jnp.float32))  # [T, H]
         weights = weights * (self.n_heads ** -0.5) * self.softmax_scale
 
-        # Aggregate across heads: [T, S, H] @ [T, H] → [T, S]
-        # Broadcasting: weights[T, H] → weights[T, 1, H] for batch matmul
-        indexer_score = jnp.einsum("TSH,TH->TS", logits, weights)
+        # Aggregate across heads
+        indexer_score = jnp.einsum("TSH,TH->TS", logits, weights)  # [T, S]
 
         # Top-K selection
-        _, topk_indices = jax.lax.top_k(indexer_score, k=self.topk)  # [T, topk]
-
+        _, topk_indices = jax.lax.top_k(indexer_score, k=self.topk)
         return topk_indices, indexer_score
+
+    def __call__(
+        self,
+        hidden_states: jax.Array,
+        q_compressed: jax.Array,
+        positions: jax.Array,
+        rope: RotaryEmbedding,
+    ) -> Tuple[Optional[jax.Array], Optional[jax.Array]]:
+        """Compute top-K KV indices for sparse attention (prefill mode).
+
+        All tokens' hidden_states are available. Computes K from hidden_states
+        directly (no cache needed for prefill).
+
+        Args:
+            hidden_states: [T, D] — current layer input (all tokens).
+            q_compressed: [T, q_lora_rank] — compressed query.
+            positions: [T] — token positions.
+            rope: RotaryEmbedding instance.
+
+        Returns:
+            (topk_indices, indexer_score) or (None, None) if seq_len <= topk.
+        """
+        seq_len = hidden_states.shape[0]
+        if seq_len <= self.topk:
+            return None, None
+
+        q = self._compute_q(q_compressed, positions, rope)
+        k = self.compute_k(hidden_states, positions, rope)
+        return self._score_and_topk(q, k, hidden_states)
+
+    def forward_decode(
+        self,
+        hidden_states: jax.Array,
+        q_compressed: jax.Array,
+        positions: jax.Array,
+        rope: RotaryEmbedding,
+        indexer_k_cache: jax.Array,
+        seq_len: jax.Array,
+    ) -> Tuple[jax.Array, jax.Array, jax.Array]:
+        """Compute top-K indices for decode (single token, uses cache).
+
+        JIT-compatible: scores against the full cache (static shape) and masks
+        invalid positions to -inf. When seq_len <= topk, top-K returns all
+        valid positions plus some masked ones (harmless for attention since
+        the gathered KV at masked positions is zero and gets near-zero weight
+        after softmax).
+
+        Args:
+            hidden_states: [1, D] — current token only.
+            q_compressed: [1, q_lora_rank] — compressed query for current token.
+            positions: [1] — current token position.
+            rope: RotaryEmbedding instance.
+            indexer_k_cache: [max_seq_len, head_dim] — cached historical K.
+            seq_len: scalar — total sequence length including current token
+                (may be a traced JAX value).
+
+        Returns:
+            (topk_indices, indexer_score, updated_cache):
+                topk_indices: [1, topk] — always returned (no None).
+                indexer_score: [1, max_seq_len] — scores with -inf for
+                    invalid positions.
+                updated_cache: [max_seq_len, head_dim].
+        """
+        cur_k = self.compute_k(hidden_states, positions, rope)  # [1, head_dim]
+        indexer_k_cache = indexer_k_cache.at[positions[0]].set(cur_k[0])
+
+        q = self._compute_q(q_compressed, positions, rope)  # [1, H, D]
+
+        # Score against full cache (static shape for JIT)
+        logits = jnp.einsum("THD,SD->TSH", q, indexer_k_cache)
+        logits = jax.nn.relu(logits)
+
+        weights = self.weights_proj(hidden_states.astype(jnp.float32))
+        weights = weights * (self.n_heads ** -0.5) * self.softmax_scale
+        indexer_score = jnp.einsum("TSH,TH->TS", logits, weights)
+
+        # Mask invalid positions (>= seq_len)
+        max_seq_len = indexer_k_cache.shape[0]
+        valid_mask = jnp.arange(max_seq_len) < seq_len
+        indexer_score = jnp.where(
+            valid_mask[None, :], indexer_score,
+            jnp.finfo(jnp.float32).min)
+
+        _, topk_indices = jax.lax.top_k(indexer_score, k=self.topk)
+
+        return topk_indices, indexer_score, indexer_k_cache

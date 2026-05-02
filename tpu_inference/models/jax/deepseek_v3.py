@@ -52,6 +52,9 @@ from tpu_inference.layers.jax.moe.moe import JaxMoE
 from tpu_inference.layers.jax.moe.utils import (get_expert_parallelism,
                                                 select_moe_backend)
 from tpu_inference.layers.jax.attention.indexer import DSAIndexer
+from tpu_inference.kernels.mla.v1.kernel import (
+    update_kv_cache as mla_v1_update_kv_cache,
+)
 from tpu_inference.layers.jax.norm import JaxRmsNorm
 from tpu_inference.layers.jax.pp_utils import PPMissingLayer, make_layers
 from tpu_inference.layers.jax.quantization.configs import QuantizationConfig
@@ -72,6 +75,81 @@ logger = init_logger(__name__)
 
 def _weight_init(random_init: bool):
     return sharded_initializer if random_init else nnx.initializers.uniform()
+
+
+def _align_to(x, a):
+    return ((x + a - 1) // a) * a
+
+
+def _gather_from_paged_cache(
+    cache_kv: jax.Array,
+    token_positions: jax.Array,
+    block_tables: jax.Array,
+    max_num_seqs: int,
+    seq_idx: int = 0,
+) -> jax.Array:
+    """Gather KV at absolute token positions from paged cache.
+
+    Args:
+        cache_kv: [total_pages, ps_per_packing, kv_packing, kv_dim]
+        token_positions: [K] — absolute positions in the sequence
+        block_tables: [max_num_seqs * pages_per_seq] — flat page indices
+        max_num_seqs: number of sequences
+        seq_idx: which sequence to gather from
+
+    Returns:
+        [K, kv_dim] — gathered KV vectors
+    """
+    _, ps_per_packing, kv_packing, _ = cache_kv.shape
+    page_size = ps_per_packing * kv_packing
+    pages_per_seq = block_tables.shape[0] // max_num_seqs
+
+    page_num_in_seq = token_positions // page_size
+    page_indices_start = seq_idx * pages_per_seq
+    physical_page = block_tables[page_indices_start + page_num_in_seq]
+
+    row = (token_positions % page_size) // kv_packing
+    col = (token_positions % page_size) % kv_packing
+
+    return cache_kv[physical_page, row, col, :]
+
+
+def _reference_mla_attention(
+    q_TNA: jax.Array,
+    q_rope_TNH: jax.Array,
+    gathered_kv: jax.Array,
+    lkv_dim: int,
+    r_dim: int,
+    sm_scale: float,
+) -> jax.Array:
+    """Reference absorbed MLA attention on gathered KV (pure JAX).
+
+    Replicates MLA Pallas kernel: Q·K in compressed space, V = kv_c.
+
+    Args:
+        q_TNA: [T, N, lkv_dim] — absorbed query (ql_nope)
+        q_rope_TNH: [T, N, r_dim] — query RoPE component
+        gathered_kv: [K, cache_kv_dim] — compressed KV from cache
+        lkv_dim: latent KV dimension (512)
+        r_dim: RoPE dimension (64)
+        sm_scale: softmax scale
+
+    Returns:
+        [T, N, lkv_dim] — attention output in latent space
+    """
+    aligned_lkv_dim = _align_to(lkv_dim, 128)
+
+    kv_c = gathered_kv[:, :lkv_dim]
+    k_pe = gathered_kv[:, aligned_lkv_dim:aligned_lkv_dim + r_dim]
+
+    q = jnp.concatenate([q_TNA, q_rope_TNH], axis=-1)
+    k = jnp.concatenate([kv_c, k_pe], axis=-1)
+
+    score = jnp.einsum("tnd,kd->tnk", q, k) * sm_scale
+    weights = jax.nn.softmax(score.astype(jnp.float32), axis=-1)
+    output = jnp.einsum("tnk,kd->tnd", weights.astype(q_TNA.dtype), kv_c)
+
+    return output
 
 
 modeling_flax_utils = FlaxUtils()
@@ -271,26 +349,35 @@ class DeepseekV3BaseAttention(JaxModule):
             self, x: jax.Array, kv_cache: KVCache,
             attention_metadata: AttentionMetadata
     ) -> Tuple[KVCache, jax.Array]:
-        """Performs the forward pass of the attention module.  Expects that the
-        child class has implemented the `compute_q_projection`, `compute_kv_projection`,
-        and `compute_attention` methods.
+        """Performs the forward pass of the attention module.
+
+        For DSA (Dynamic Sparse Attention) layers, kv_cache is a tuple
+        (main_cache, indexer_cache). Decode uses indexer to select top-K
+        KV positions for sparse attention; prefill populates the indexer
+        cache and uses full dense attention.
 
         Args:
-            x: The input tensor of shape `(batch_size, seq_len, d_model)`.
-            kv_cache: The key-value cache for storing past attention states.
-            attention_metadata: Metadata for attention, such as input positions.
+            x: Input tensor of shape (num_tokens, d_model).
+            kv_cache: KV cache — single array or (main_cache, indexer_cache)
+                tuple for DSA layers.
+            attention_metadata: Attention metadata (positions, seq_lens, etc).
 
         Returns:
-            A tuple containing:
-                - The updated KV cache.
-                - The attention output tensor of shape
-                  `(batch_size, seq_len, d_model)`.
+            (updated_kv_cache, attention_output) — kv_cache preserves its
+            input structure (tuple for DSA, array otherwise).
         """
 
         md = attention_metadata
         x = jnp.asarray(x, self.dtype)
         x_SD = lax.with_sharding_constraint(x, self.activation_attention_td)
         x_q_TD = lax.with_sharding_constraint(x, self.activation_q_td)
+
+        # Unpack tuple kv_cache for DSA layers: (main_cache, indexer_cache)
+        indexer_cache = None
+        main_kv_cache = kv_cache
+        if (hasattr(self, 'indexer') and self.indexer is not None
+                and isinstance(kv_cache, tuple)):
+            main_kv_cache, indexer_cache = kv_cache
 
         with jax.named_scope("q_proj"):
             q_result = self.compute_q_projection(x_q_TD, md.input_positions)
@@ -304,32 +391,53 @@ class DeepseekV3BaseAttention(JaxModule):
         with jax.named_scope("kv_proj"):
             kv_data = self.compute_kv_projection(x_SD, md.input_positions)
 
-        if hasattr(self, 'indexer') and self.indexer is not None and q_compressed is not None:
-            with jax.named_scope("dsa_indexer"):
-                topk_indices, indexer_score = self.indexer(
-                    x_SD, q_compressed, md.input_positions, self.rope
-                )
-                if topk_indices is not None:
-                    jax.debug.print(
-                        "DSA Indexer: seq_len={sl}, topk shape={ts}",
-                        sl=x_SD.shape[0], ts=topk_indices.shape
+        is_dsa_active = (
+            hasattr(self, 'indexer') and self.indexer is not None
+            and q_compressed is not None and indexer_cache is not None
+        )
+        num_tokens = x_SD.shape[0]
+        new_indexer_cache = indexer_cache
+
+        if is_dsa_active and num_tokens == 1:
+            # DSA decode: indexer → top-K → sparse attention
+            with jax.named_scope("dsa_decode"):
+                new_main_cache, new_indexer_cache, outputs_TNH = (
+                    self.dsa_compute_attention(
+                        x_SD, q_data, q_compressed, kv_data,
+                        main_kv_cache, indexer_cache, md
                     )
+                )
+        elif is_dsa_active and num_tokens > 1:
+            # DSA prefill: populate indexer cache, full dense attention
+            with jax.named_scope("dsa_prefill"):
+                indexer_k = self.indexer.compute_k(
+                    x_SD, md.input_positions, self.rope
+                )
+                new_indexer_cache = indexer_cache.at[
+                    md.input_positions].set(indexer_k)
 
-        with jax.named_scope("attn_op"):
-            new_kv_cache, outputs_TNH = self.compute_attention(
-                q_data, kv_data, kv_cache, md)
+            with jax.named_scope("attn_op"):
+                new_main_cache, outputs_TNH = self.compute_attention(
+                    q_data, kv_data, main_kv_cache, md)
+        else:
+            # Standard attention (no DSA)
+            with jax.named_scope("attn_op"):
+                new_main_cache, outputs_TNH = self.compute_attention(
+                    q_data, kv_data, main_kv_cache, md)
 
-            outputs_TNH = self.process_output(outputs_TNH)
+        outputs_TNH = self.process_output(outputs_TNH)
 
-            if outputs_TNH.shape[-1] != self.v_head_dim:
-                outputs_TNH = outputs_TNH[..., :self.v_head_dim]
+        if outputs_TNH.shape[-1] != self.v_head_dim:
+            outputs_TNH = outputs_TNH[..., :self.v_head_dim]
 
-            with jax.named_scope("o_proj"):
-                outputs_TR = outputs_TNH.reshape(outputs_TNH.shape[0],
-                                                 self.N * self.v_head_dim)
-                o_TD = self.o_proj(outputs_TR)
+        with jax.named_scope("o_proj"):
+            outputs_TR = outputs_TNH.reshape(outputs_TNH.shape[0],
+                                             self.N * self.v_head_dim)
+            o_TD = self.o_proj(outputs_TR)
 
-            return new_kv_cache, o_TD
+        if new_indexer_cache is not None:
+            return (new_main_cache, new_indexer_cache), o_TD
+        return new_main_cache, o_TD
 
 
 @dataclass(kw_only=True)
@@ -763,6 +871,75 @@ class DeepseekV3MLA(DeepseekV3BaseAttention):
         # Outputs from MLA kernel are in latent space (TNA), project to TNH
         outputs_TNH = self.v_up_proj(outputs_TNA)
         return outputs_TNH
+
+    def dsa_compute_attention(
+        self,
+        x_SD: jax.Array,
+        q_data: Tuple[jax.Array, jax.Array],
+        q_compressed: jax.Array,
+        kv_data: Tuple[jax.Array, jax.Array],
+        kv_cache: jax.Array,
+        indexer_cache: jax.Array,
+        md: AttentionMetadata,
+    ) -> Tuple[jax.Array, jax.Array, jax.Array]:
+        """DSA decode: indexer → top-K → gather → reference MLA attention.
+
+        Args:
+            x_SD: [1, D] — current token hidden states.
+            q_data: (q_TNA [1, N, lkv_dim], q_rope_TNH [1, N, r_dim]).
+            q_compressed: [1, q_lora_rank] — compressed query for indexer.
+            kv_data: (kv_SA [1, lkv_dim], k_rope_SH [1, r_dim]).
+            kv_cache: [total_pages, ps/packing, packing, kv_dim] — main cache.
+            indexer_cache: [max_seq_len, indexer_head_dim] — indexer K cache.
+            md: AttentionMetadata.
+
+        Returns:
+            (updated_cache, updated_indexer_cache, output_TNA):
+                output_TNA: [1, N, lkv_dim] — latent-space attention output.
+        """
+        q_TNA, q_rope_TNH = q_data
+        kv_SA, k_rope_SH = kv_data
+
+        if self.kv_cache_quantized_dtype:
+            k_scale = self._k_scale
+            kv_SA, _ = quantize_kv(self.kv_cache_quantized_dtype,
+                                   kv_SA, value=None, k_scale=k_scale)
+            k_rope_SH, _ = quantize_kv(self.kv_cache_quantized_dtype,
+                                       k_rope_SH, value=None,
+                                       k_scale=k_scale)
+
+        updated_cache = mla_v1_update_kv_cache(
+            kv_SA, k_rope_SH, kv_cache,
+            md.seq_lens, md.block_tables, md.query_start_loc,
+            md.request_distribution,
+        )
+
+        topk_indices, _, new_indexer_cache = self.indexer.forward_decode(
+            x_SD, q_compressed, md.input_positions, self.rope,
+            indexer_cache, md.seq_lens[0],
+        )
+        topk_pos = topk_indices[0]  # [topk]
+
+        cur_pos = md.input_positions[0]
+        is_in_topk = jnp.any(topk_pos == cur_pos)
+        topk_pos = jnp.where(
+            is_in_topk, topk_pos,
+            topk_pos.at[-1].set(cur_pos),
+        )
+
+        max_num_seqs = md.seq_lens.shape[0]
+        gathered_kv = _gather_from_paged_cache(
+            updated_cache, topk_pos, md.block_tables, max_num_seqs,
+        )
+
+        output_TNA = _reference_mla_attention(
+            q_TNA, q_rope_TNH, gathered_kv,
+            lkv_dim=self.kv_lora_rank,
+            r_dim=self.qk_rope_head_dim,
+            sm_scale=self.scale,
+        )
+
+        return updated_cache, new_indexer_cache, output_TNA
 
 
 @dataclass(kw_only=True)

@@ -806,7 +806,22 @@ class KVCacheManager:
                             cache_dtype=t2j_dtype(layer_spec.dtype),
                             use_mla=self.use_mla,
                         )[0]
-                        kv_caches.append(kv_cache)
+
+                        # DSA: allocate indexer K cache alongside main cache
+                        indexer_head_dim = getattr(
+                            text_config, "indexer_head_dim", 0)
+                        model_type = getattr(text_config, "model_type", "")
+                        if indexer_head_dim == 0 and model_type in (
+                                "deepseek_v32", "glm_moe_dsa"):
+                            indexer_head_dim = 128
+                        if indexer_head_dim > 0 and self.use_mla:
+                            max_seq_len = self.runner.max_model_len
+                            indexer_cache = jnp.zeros(
+                                (max_seq_len, indexer_head_dim),
+                                dtype=jnp.bfloat16)
+                            kv_caches.append((kv_cache, indexer_cache))
+                        else:
+                            kv_caches.append(kv_cache)
 
                         # Update Regular Attention Metadata
                         metadata["regular_attn"].count += 1
@@ -889,7 +904,11 @@ class KVCacheManager:
 
         # Explicitly delete each JAX array to release HBM.
         for kv_cache in kv_caches:
-            kv_cache.delete()
+            if isinstance(kv_cache, tuple):
+                for arr in kv_cache:
+                    arr.delete()
+            else:
+                kv_cache.delete()
         self.runner.kv_caches.clear()
         self.runner.layer_name_to_kvcache_index.clear()
 
