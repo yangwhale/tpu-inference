@@ -29,6 +29,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import nnx
+from jax.sharding import Mesh
 
 from tpu_inference.kernels.mla.v1.kernel import (
     update_kv_cache as mla_v1_update_kv_cache,
@@ -45,6 +46,11 @@ from tpu_inference.models.jax.deepseek_v3 import (
     _reference_mla_attention,
 )
 
+# Set global mesh so RoPE initialize_cache() can use PartitionSpec sharding
+_devices = jax.devices()
+_mesh = Mesh(np.array(_devices), axis_names=("x",))
+jax.set_mesh(_mesh)
+
 # V3.2 production values
 LKV_DIM = 512        # kv_lora_rank
 R_DIM = 64           # qk_rope_head_dim
@@ -57,7 +63,7 @@ INDEXER_TOPK = 2048
 
 
 def _make_rope(rotary_dim=R_DIM, dtype=jnp.bfloat16):
-    return DeepseekScalingRotaryEmbedding(
+    rope = DeepseekScalingRotaryEmbedding(
         rotary_dim=rotary_dim,
         rope_theta=10000,
         original_max_position_embeddings=4096,
@@ -68,6 +74,8 @@ def _make_rope(rotary_dim=R_DIM, dtype=jnp.bfloat16):
         mscale_value=1.0,
         mscale_all_dim=1.0,
     )
+    rope.initialize_cache()
+    return rope
 
 
 def _make_cache(total_pages, page_size, kv_dim, dtype=jnp.bfloat16):
@@ -112,7 +120,7 @@ class TestGatherFromPagedCache(unittest.TestCase):
         for p in range(self.total_pages):
             for r in range(ps_per_packing):
                 for c in range(self.kv_packing):
-                    data[p, r, c, 0] = p * 10000 + r * 100 + c
+                    data[p, r, c, 0] = float(p * 8 + r * 4 + c)
         self.cache = jnp.array(data, dtype=self.dtype)
 
         self.block_tables = jnp.arange(self.total_pages, dtype=jnp.int32)
@@ -131,7 +139,7 @@ class TestGatherFromPagedCache(unittest.TestCase):
             page = pos_val // self.page_size
             row = (pos_val % self.page_size) // self.kv_packing
             col = (pos_val % self.page_size) % self.kv_packing
-            expected = page * 10000 + row * 100 + col
+            expected = float(page * 8 + row * 4 + col)
             actual = float(gathered[i, 0])
             self.assertAlmostEqual(actual, expected, places=0,
                                    msg=f"pos={pos_val}")
