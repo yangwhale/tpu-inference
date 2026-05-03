@@ -55,6 +55,9 @@ from tpu_inference.layers.jax.attention.indexer import DSAIndexer
 from tpu_inference.kernels.mla.v1.kernel import (
     update_kv_cache as mla_v1_update_kv_cache,
 )
+from tpu_inference.kernels.mla.v2.kernel import (
+    mla_ragged_paged_attention as mla_v2_ragged_paged_attention,
+)
 from tpu_inference.layers.jax.norm import JaxRmsNorm
 from tpu_inference.layers.jax.pp_utils import PPMissingLayer, make_layers
 from tpu_inference.layers.jax.quantization.configs import QuantizationConfig
@@ -401,21 +404,49 @@ class DeepseekV3BaseAttention(JaxModule):
         num_tokens = x_SD.shape[0]
         new_indexer_cache = indexer_cache
 
-        if is_dsa_active and num_tokens == 1:
-            # DSA decode: indexer → top-K → sparse attention
-            with jax.named_scope("dsa_decode"):
-                new_main_cache, new_indexer_cache, outputs_TNH = (
-                    self.dsa_compute_attention(
+        if is_dsa_active and num_tokens <= 16:
+            # num_tokens <= 16: could be decode (padded to 16) or tiny prefill.
+            # Use jax.lax.cond with request_distribution[0] for runtime dispatch.
+            is_decode = md.request_distribution[0] > 0
+
+            def _decode_fn(_):
+                # Nested dispatch: DSA only when seq_len > topk.
+                # When seq_len <= topk, all KV fit — Dense is correct and faster.
+                use_dsa = md.seq_lens[0] > self.indexer.topk
+
+                def _dsa_branch(_):
+                    return self.dsa_compute_attention(
                         x_SD, q_data, q_compressed, kv_data,
-                        main_kv_cache, indexer_cache, md
-                    )
-                )
-        elif is_dsa_active and num_tokens > 1:
-            # DSA prefill: populate indexer cache, full dense attention
+                        main_kv_cache, indexer_cache, md)
+
+                def _dense_decode_branch(_):
+                    indexer_k = self.indexer.compute_k(
+                        x_SD, md.input_positions, self.rope)
+                    new_idx = indexer_cache.at[
+                        md.input_positions[0:1]].set(indexer_k[0:1])
+                    new_main, out = self.compute_attention(
+                        q_data, kv_data, main_kv_cache, md)
+                    return new_main, new_idx, out
+
+                return jax.lax.cond(
+                    use_dsa, _dsa_branch, _dense_decode_branch, None)
+
+            def _prefill_fn(_):
+                indexer_k = self.indexer.compute_k(
+                    x_SD, md.input_positions, self.rope)
+                new_idx = indexer_cache.at[
+                    md.input_positions].set(indexer_k)
+                new_main, out = self.compute_attention(
+                    q_data, kv_data, main_kv_cache, md)
+                return new_main, new_idx, out
+
+            new_main_cache, new_indexer_cache, outputs_TNH = jax.lax.cond(
+                is_decode, _decode_fn, _prefill_fn, None)
+        elif is_dsa_active:
+            # num_tokens > 16: always prefill — no runtime dispatch needed.
             with jax.named_scope("dsa_prefill"):
                 indexer_k = self.indexer.compute_k(
-                    x_SD, md.input_positions, self.rope
-                )
+                    x_SD, md.input_positions, self.rope)
                 new_indexer_cache = indexer_cache.at[
                     md.input_positions].set(indexer_k)
 
@@ -885,24 +916,11 @@ class DeepseekV3MLA(DeepseekV3BaseAttention):
         indexer_cache: jax.Array,
         md: AttentionMetadata,
     ) -> Tuple[jax.Array, jax.Array, jax.Array]:
-        """DSA decode: indexer → top-K → gather → reference MLA attention.
-
-        Args:
-            x_SD: [1, D] — current token hidden states.
-            q_data: (q_TNA [1, N, lkv_dim], q_rope_TNH [1, N, r_dim]).
-            q_compressed: [1, q_lora_rank] — compressed query for indexer.
-            kv_data: (kv_SA [1, lkv_dim], k_rope_SH [1, r_dim]).
-            kv_cache: [total_pages, ps/packing, packing, kv_dim] — main cache.
-            indexer_cache: [max_seq_len, indexer_head_dim] — indexer K cache.
-            md: AttentionMetadata.
-
-        Returns:
-            (updated_cache, updated_indexer_cache, output_TNA):
-                output_TNA: [1, N, lkv_dim] — latent-space attention output.
-        """
+        """DSA decode: indexer top-K, gather compressed KV, V2 Pallas MLA."""
         q_TNA, q_rope_TNH = q_data
         kv_SA, k_rope_SH = kv_data
 
+        k_scale = None
         if self.kv_cache_quantized_dtype:
             k_scale = self._k_scale
             kv_SA, _ = quantize_kv(self.kv_cache_quantized_dtype,
@@ -921,7 +939,7 @@ class DeepseekV3MLA(DeepseekV3BaseAttention):
             x_SD, q_compressed, md.input_positions, self.rope,
             indexer_cache, md.seq_lens[0],
         )
-        topk_pos = topk_indices[0]  # [topk]
+        topk_pos = topk_indices[0]
 
         cur_pos = md.input_positions[0]
         is_in_topk = jnp.any(topk_pos == cur_pos)
@@ -935,12 +953,81 @@ class DeepseekV3MLA(DeepseekV3BaseAttention):
             updated_cache, topk_pos, md.block_tables, max_num_seqs,
         )
 
-        output_TNA = _reference_mla_attention(
-            q_TNA, q_rope_TNH, gathered_kv,
-            lkv_dim=self.kv_lora_rank,
-            r_dim=self.qk_rope_head_dim,
-            sm_scale=self.scale,
+        _, ps_per_packing, kv_packing, kv_dim = updated_cache.shape
+        page_size = ps_per_packing * kv_packing
+        topk = self.indexer.topk
+        num_vp = (topk + page_size - 1) // page_size
+
+        cur_idx_in_gathered = jnp.argmax(topk_pos == cur_pos)
+        gathered_kv = gathered_kv.at[cur_idx_in_gathered].set(
+            gathered_kv[topk - 1])
+        gathered_kv_rest = gathered_kv[:topk - 1]
+
+        padded = jnp.zeros(
+            (num_vp * page_size, kv_dim), dtype=gathered_kv.dtype)
+        padded = padded.at[:topk - 1].set(gathered_kv_rest)
+        virtual_cache = padded.reshape(
+            num_vp, ps_per_packing, kv_packing, kv_dim)
+
+        virtual_seq_lens = jnp.where(md.seq_lens > 0, topk, 0)
+        pages_per_seq = md.block_tables.shape[0] // md.seq_lens.shape[0]
+        vp_template = jnp.where(
+            jnp.arange(pages_per_seq) < num_vp,
+            jnp.arange(pages_per_seq), 0).astype(jnp.int32)
+        active = (md.seq_lens > 0).astype(jnp.int32)
+        virtual_block_tables = (
+            active[:, None] * vp_template[None, :]).ravel()
+
+        q_spec = self.query_tnh or P(
+            ShardingAxisName.MLP_TENSOR, None, None)
+        kv_spec = self.keyvalue_skh or P(
+            ShardingAxisName.MLP_TENSOR, None)
+        o_spec = self.attn_o_tnh or P(
+            ShardingAxisName.MLP_TENSOR, None, None)
+
+        in_specs = (
+            q_spec, q_spec,
+            kv_spec, kv_spec,
+            P(None, None, None, None),
+            P(ShardingAxisName.ATTN_DATA),
+            P(ShardingAxisName.ATTN_DATA),
+            P(ShardingAxisName.ATTN_DATA),
+            P(ShardingAxisName.ATTN_DATA),
         )
+        out_specs = (
+            P(None, None, None, None),
+            o_spec,
+        )
+
+        _sm_scale = self.scale
+        _k_scale_val = k_scale
+
+        def _dsa_kernel(q, q_rope, k, k_rope, cache,
+                        kv_lens, page_idx, cu_q, dist):
+            out, new_cache = mla_v2_ragged_paged_attention(
+                q, q_rope, k, k_rope, cache,
+                kv_lens, page_idx, cu_q, dist,
+                sm_scale=_sm_scale,
+                k_scale=_k_scale_val,
+                v_scale=_k_scale_val,
+                num_kv_pages_per_block=(3, 1, 1),
+                num_queries_per_block=(1, 16, 16),
+                decode_batch_size=4,
+            )
+            return new_cache, out
+
+        _, output_TNA = jax.jit(
+            jax.shard_map(
+                _dsa_kernel,
+                mesh=self.mesh,
+                in_specs=in_specs,
+                out_specs=out_specs,
+                check_vma=False,
+            )
+        )(q_TNA, q_rope_TNH, kv_SA, k_rope_SH,
+          virtual_cache,
+          virtual_seq_lens, virtual_block_tables,
+          md.query_start_loc, md.request_distribution)
 
         return updated_cache, new_indexer_cache, output_TNA
 
