@@ -3,24 +3,22 @@
   "date": "2026-05-02",
   "hardware": "TPU v7x-8 (4 chips, 8 devices, 768 GB HBM)",
   "model": "DeepSeek-V3.2 (671B MoE, 61 layers)",
-  "config": {
-    "max_model_len": 65536,
-    "tensor_parallel_size": 8,
-    "expert_parallelism": 8,
-    "gpu_memory_utilization": 0.92,
-    "max_num_seqs": 1,
-    "enable_dp_attention": true,
-    "quantization": "fp8",
-    "moe_cache": "fp4 (610 GB in /dev/shm)"
-  },
   "dsa_config": {
     "indexer_topk": 2048,
     "indexer_head_dim": 128,
     "indexer_n_heads": 64,
     "dsa_layers": 61
   },
-  "notes": "DISABLE_DSA toggle via /tmp/DISABLE_DSA sentinel file. Dense and DSA tests run on same server config (max-model-len=65536). Each context length has 1 warmup + 2 measured runs.",
-  "results": {
+  "phase5_results": {
+    "description": "max-model-len=65536, gpu-memory-utilization=0.92, 1 warmup + 2 measured runs per context",
+    "config": {
+      "max_model_len": 65536,
+      "gpu_memory_utilization": 0.92,
+      "max_num_seqs": 1,
+      "enable_dp_attention": true,
+      "quantization": "fp8",
+      "moe_cache": "fp4 (610 GB in /dev/shm)"
+    },
     "dense": [
       {"context_length": 4096, "actual_tokens": 2923, "ttft_s": 1.6, "decode_tok_per_s_run1": 41.6, "decode_tok_per_s_run2": 40.3, "decode_tok_per_s_avg": 41.0},
       {"context_length": 16384, "actual_tokens": 11715, "ttft_s": 8.1, "decode_tok_per_s_run1": 38.7, "decode_tok_per_s_run2": 38.9, "decode_tok_per_s_avg": 38.8},
@@ -34,16 +32,46 @@
       {"context_length": 65536, "actual_tokens": 46878, "ttft_s": 56.3, "decode_tok_per_s_run1": 34.8, "decode_tok_per_s_run2": 33.7, "decode_tok_per_s_avg": 34.3}
     ]
   },
+  "phase6_results": {
+    "description": "max-model-len=131072, gpu-memory-utilization=0.90, 1 warmup + 2 measured runs per context",
+    "config": {
+      "max_model_len": 131072,
+      "gpu_memory_utilization": 0.90,
+      "max_num_seqs": 1,
+      "enable_dp_attention": true,
+      "quantization": "fp8",
+      "moe_cache": "fp4 (610 GB in /dev/shm)"
+    },
+    "dense": [
+      {"context_length": 65536, "actual_tokens": 46878, "ttft_s": 55.7, "decode_tok_per_s_run1": 38.2, "decode_tok_per_s_run2": 36.9, "decode_tok_per_s_avg": 37.6},
+      {"context_length": 131072, "actual_tokens": 93757, "ttft_s": 177.5, "decode_tok_per_s_run1": 33.2, "decode_tok_per_s_run2": 33.2, "decode_tok_per_s_avg": 33.2}
+    ],
+    "dsa": [
+      {"context_length": 65536, "actual_tokens": 46878, "ttft_s": 56.4, "decode_tok_per_s_run1": 32.1, "decode_tok_per_s_run2": 31.4, "decode_tok_per_s_avg": 31.8},
+      {"context_length": 131072, "actual_tokens": 93757, "ttft_s": 178.9, "decode_tok_per_s_run1": 28.8, "decode_tok_per_s_run2": 28.9, "decode_tok_per_s_avg": 28.9}
+    ]
+  },
   "analysis": {
-    "dense_4k_to_64k_degradation_pct": -12.4,
-    "dsa_4k_to_64k_degradation_pct": -7.8,
-    "crossover_estimate": "~100K-128K tokens (extrapolated)",
-    "dense_slope_tok_per_s_per_10k_context": -0.81,
-    "dsa_slope_tok_per_s_per_10k_context": -0.46,
-    "at_64k_gap_pct": -4.7,
-    "at_32k_gap_pct": -9.8,
-    "at_128k_projected_dense_tok_per_s": 31,
-    "at_128k_projected_dsa_tok_per_s": 34,
-    "at_128k_projected_dsa_advantage_pct": 10
+    "phase5_4k_to_64k": {
+      "dense_degradation_pct": -12.4,
+      "dsa_degradation_pct": -7.8,
+      "at_64k_gap_pct": -4.7,
+      "dense_slope_per_10k": -0.81,
+      "dsa_slope_per_10k": -0.46,
+      "note": "Gap narrowing from -10% to -4.7%, predicted crossover at ~100K-128K"
+    },
+    "phase6_128k_actual": {
+      "at_64k_gap_pct": -15.4,
+      "at_128k_gap_pct": -13.0,
+      "dense_64k_to_128k_degradation_pct": -11.6,
+      "dsa_64k_to_128k_degradation_pct": -9.1,
+      "dense_slope_per_10k": -0.94,
+      "dsa_slope_per_10k": -0.62,
+      "crossover_extrapolated": "~230K tokens",
+      "note": "DSA still slower at 128K. Gap narrowing (-15.4%→-13.0%) confirms trend but crossover is further than predicted. Root cause: DSA uses reference MLA (Python einsum) vs Dense uses Pallas MLA kernel. Phase 4 optimization (Pallas kernel for virtual pages) is critical to bring crossover below 128K."
+    },
+    "phase6_vs_phase5_64k_comparison": {
+      "note": "Same 64K context shows different results under max-model-len=131072 vs 65536. Dense faster (37.6 vs 35.9), DSA slower (31.8 vs 34.3). Likely due to DP attention padding: max-model-len=131072 means larger pad per rank, increasing indexer score array size."
+    }
   }
 }
