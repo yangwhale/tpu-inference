@@ -2,7 +2,7 @@
 
 Benchmark results for **Gemma4-31B-IT** on **TPU v7xe-8** (4 chips, 8 devices, 768 GB HBM) via vLLM with the experimental Batched RPA kernel. Full 128K context window is supported after applying a [one-line kernel fix](#kernel-fix-full-128k-context-support).
 
-> **Key results**: Peak output throughput **6,144 tok/s** (P=256) · Single-user TPOT **35 ms** · Full 128K context TTFT **378 ms** · Real text = random tokens (no performance difference)
+> **Key results**: Peak output throughput **6,144 tok/s** (P=256) · Single-user TPOT **35 ms** · Full 256K context TTFT **695 ms** · Full 128K context TTFT **378 ms** · Real text = random tokens (no performance difference)
 
 ## Environment
 
@@ -14,7 +14,7 @@ Benchmark results for **Gemma4-31B-IT** on **TPU v7xe-8** (4 chips, 8 devices, 7
 | Attention Kernel | Batched RPA (`USE_BATCHED_RPA_KERNEL=1`) with [prefill_batch_size fix](#kernel-fix-full-128k-context-support) |
 | KV Cache | FP8 (`--kv-cache-dtype fp8`) |
 | Tensor Parallel | 4 (`--tensor-parallel-size 4`) |
-| Max Context | 131072 tokens (`--max-model-len 131072`) |
+| Max Context | 262144 tokens (`--max-model-len 262144`, model supports 256K natively) |
 | Chunked Prefill | 16K chunks (`--enable-chunked-prefill --max-num-batched-tokens 16384`) |
 
 ### Launch Command
@@ -26,7 +26,7 @@ export VLLM_WORKER_MULTIPROC_METHOD=fork
 vllm serve google/gemma-4-31b-it \
     --port 8000 \
     --tensor-parallel-size 4 \
-    --max-model-len 131072 \
+    --max-model-len 262144 \
     --max-num-batched-tokens 16384 \
     --enable-chunked-prefill \
     --async-scheduling \
@@ -68,18 +68,34 @@ Dataset: Shakespeare sonnets (`--dataset-name sonnet`), real English text repeat
 
 All tests output 1K tokens. \* TTFT includes queueing time.
 
+### 256K Extended Context (Sonnet Dataset)
+
+Server reconfigured with `--max-model-len 262144` to test the model's full 256K context window (`max_position_embeddings: 262144`).
+
+| # | Input Length | Concurrency | Output tok/s | Peak tok/s | TTFT | TPOT |
+|---|-------------|-------------|-------------|-----------|------|------|
+| 13 | 192K | 1 | 28.34 | 29 | 526 ms | 35 ms |
+| 14 | 224K | 1 | 28.21 | 29 | 644 ms | 35 ms |
+| 15 | 256K | 1 | 28.60 | 30 | 695 ms | 34 ms |
+| 16 | 256K | 2 | 54.12 | 58 | 980 ms* | 36 ms |
+
+All tests output 1K tokens. \* TTFT includes queueing time.
+
 ### Analysis
 
-**Decode latency (TPOT)** is remarkably stable: 35-42 ms across all scenarios regardless of input length (1K→128K) or concurrency (1→256). This confirms that decode performance is independent of context length once KV cache is populated.
+**Decode latency (TPOT)** is remarkably stable: 34-42 ms across all scenarios regardless of input length (1K→256K) or concurrency (1→256). This confirms that decode performance is independent of context length once KV cache is populated.
 
-**Prefill latency (TTFT)** scales linearly with input length in single-user mode: 86 ms (1K) → 196 ms (64K) → 421 ms (128K). With chunked prefill enabled (16K chunks), a 128K input is processed in ~8 chunks. Under concurrency, TTFT includes queueing delay as requests wait for prefill scheduling.
+**Prefill latency (TTFT)** scales linearly with input length in single-user mode: 86 ms (1K) → 196 ms (64K) → 378 ms (128K) → 695 ms (256K). With chunked prefill enabled (16K chunks), a 256K input is processed in ~16 chunks. Under concurrency, TTFT includes queueing delay as requests wait for prefill scheduling.
 
 **Throughput scaling** is near-linear with concurrency:
 - 1→4 users (64K): 27 → 83 output tok/s (3.1x)
 - 1→2 users (128K): 28 → 45 output tok/s (1.6x)
+- 1→2 users (256K): 29 → 54 output tok/s (1.9x)
 - Peak at P=256 (1K): **6,144 output tok/s**
 
 **Real text vs random tokens**: Tests 5-6 (random, 64K/128K) vs tests 7, 10 (sonnet, 64K/128K) show near-identical TPOT (35-37 ms) and throughput (27-28 tok/s), confirming the attention kernel performs consistently with natural language.
+
+**256K full context**: The model's full 256K context window (`max_position_embeddings: 262144`) works without issues. TTFT remains under 700 ms for single-user 256K, and dual-concurrent 256K runs successfully with near-2x throughput scaling.
 
 ### Detailed Commands
 
@@ -141,6 +157,27 @@ vllm bench serve --dataset-name sonnet \
     --dataset-path /workspace/vllm/benchmarks/sonnet.txt \
     --sonnet-input-len 63488 --sonnet-output-len 1024 \
     --num-prompts 4 --max-concurrency 4 --num-warmups 1 --ignore-eos
+```
+
+</details>
+
+<details>
+<summary>256K extended context benchmarks (tests 13-16)</summary>
+
+Server reconfigured with `--max-model-len 262144` for these tests.
+
+```bash
+# Tests 13-15: Single user at 192K/224K/256K
+vllm bench serve --dataset-name sonnet \
+    --dataset-path /workspace/vllm/benchmarks/sonnet.txt \
+    --sonnet-input-len <196608|229376|261120> --sonnet-output-len 1024 \
+    --num-prompts 1 --max-concurrency 1 --num-warmups 1 --ignore-eos
+
+# Test 16: 256K dual concurrent
+vllm bench serve --dataset-name sonnet \
+    --dataset-path /workspace/vllm/benchmarks/sonnet.txt \
+    --sonnet-input-len 261120 --sonnet-output-len 1024 \
+    --num-prompts 2 --max-concurrency 2 --num-warmups 1 --ignore-eos
 ```
 
 </details>
