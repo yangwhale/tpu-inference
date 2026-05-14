@@ -146,6 +146,132 @@ vllm bench serve --dataset-name random \
 | Median TTFT | 421 ms |
 | Median TPOT | 37 ms |
 
+## Long Text Benchmark (Sonnet Dataset — 2026-05-14)
+
+Real English text benchmark using Shakespeare sonnets (`--dataset-name sonnet`). Unlike random tokens, sonnet tests realistic tokenization patterns and attention behavior with natural language at extreme context lengths.
+
+### Summary Table
+
+| Test | Input | Concurrency | Output tok/s | Peak tok/s | Median TTFT | Median TPOT | Status |
+|------|-------|-------------|-------------|-----------|-------------|-------------|--------|
+| L1: 64K Single | 64K | 1 | 27.49 | 29 | 231 ms | 36 ms | PASS |
+| L2: 96K Single | 96K | 1 | 26.74 | 28 | 302 ms | 37 ms | PASS |
+| L3: 120K Single | 120K | 1 | 27.39 | 29 | 373 ms | 36 ms | PASS |
+| L4: 128K Single | 128K | 1 | 27.98 | 29 | 378 ms | 35 ms | PASS |
+| L5: 128K Dual | 128K | 2 | 44.98 | 58 | 4,714 ms | 40 ms | PASS |
+| L6: 64K Quad | 64K | 4 | 82.99 | 112 | 6,052 ms | 42 ms | PASS |
+
+### Key Findings
+
+- **TPOT stability**: 35-42 ms across all input lengths (64K-128K), confirming decode performance is independent of context length
+- **TTFT scales linearly**: 231 ms (64K) → 378 ms (128K), consistent with chunked prefill processing (~8 chunks for 128K)
+- **Concurrent 128K works**: Two simultaneous 128K requests (L5) complete successfully with near-linear throughput scaling (28→45 tok/s)
+- **Real text ≈ random tokens**: No significant performance difference vs random token benchmarks (Round 5 B6/B7), indicating stable attention kernel behavior with natural language
+
+### Detailed Results
+
+#### L1 — 64K Single User (Sonnet)
+
+```
+vllm bench serve --dataset-name sonnet \
+    --dataset-path /workspace/vllm/benchmarks/sonnet.txt \
+    --sonnet-input-len 63488 --sonnet-output-len 1024 \
+    --num-prompts 1 --max-concurrency 1 --num-warmups 1 --ignore-eos
+```
+
+| Metric | Value |
+|--------|-------|
+| Output tok/s | 27.49 |
+| Peak tok/s | 29 |
+| Median TTFT | 231 ms |
+| Median TPOT | 36 ms |
+
+#### L2 — 96K Single User (Sonnet)
+
+```
+vllm bench serve --dataset-name sonnet \
+    --dataset-path /workspace/vllm/benchmarks/sonnet.txt \
+    --sonnet-input-len 98304 --sonnet-output-len 1024 \
+    --num-prompts 1 --max-concurrency 1 --num-warmups 1 --ignore-eos
+```
+
+| Metric | Value |
+|--------|-------|
+| Output tok/s | 26.74 |
+| Peak tok/s | 28 |
+| Median TTFT | 302 ms |
+| Median TPOT | 37 ms |
+
+#### L3 — 120K Single User (Sonnet)
+
+```
+vllm bench serve --dataset-name sonnet \
+    --dataset-path /workspace/vllm/benchmarks/sonnet.txt \
+    --sonnet-input-len 122880 --sonnet-output-len 1024 \
+    --num-prompts 1 --max-concurrency 1 --num-warmups 1 --ignore-eos
+```
+
+| Metric | Value |
+|--------|-------|
+| Output tok/s | 27.39 |
+| Peak tok/s | 29 |
+| Median TTFT | 373 ms |
+| Median TPOT | 36 ms |
+
+#### L4 — 128K Single User (Sonnet)
+
+Full context window with real text.
+
+```
+vllm bench serve --dataset-name sonnet \
+    --dataset-path /workspace/vllm/benchmarks/sonnet.txt \
+    --sonnet-input-len 130048 --sonnet-output-len 1024 \
+    --num-prompts 1 --max-concurrency 1 --num-warmups 1 --ignore-eos
+```
+
+| Metric | Value |
+|--------|-------|
+| Output tok/s | 27.98 |
+| Peak tok/s | 29 |
+| Median TTFT | 378 ms |
+| Median TPOT | 35 ms |
+
+#### L5 — 128K Dual Concurrent (Sonnet)
+
+Two simultaneous 128K requests — tests memory pressure under concurrent full-context workloads.
+
+```
+vllm bench serve --dataset-name sonnet \
+    --dataset-path /workspace/vllm/benchmarks/sonnet.txt \
+    --sonnet-input-len 130048 --sonnet-output-len 1024 \
+    --num-prompts 2 --max-concurrency 2 --num-warmups 1 --ignore-eos
+```
+
+| Metric | Value |
+|--------|-------|
+| Output tok/s | 44.98 |
+| Peak tok/s | 58 |
+| Median TTFT | 4,714 ms |
+| Median TPOT | 40 ms |
+
+#### L6 — 64K Quad Concurrent (Sonnet)
+
+Four simultaneous 64K requests — tests throughput scaling at moderate context length.
+
+```
+vllm bench serve --dataset-name sonnet \
+    --dataset-path /workspace/vllm/benchmarks/sonnet.txt \
+    --sonnet-input-len 63488 --sonnet-output-len 1024 \
+    --num-prompts 4 --max-concurrency 4 --num-warmups 1 --ignore-eos
+```
+
+| Metric | Value |
+|--------|-------|
+| Output tok/s | 82.99 |
+| Peak tok/s | 112 |
+| Median TTFT | 6,052 ms |
+| Median TPOT | 42 ms |
+
 ## Kernel Fix: Full 128K Context Support
 
 ### Problem
@@ -187,6 +313,7 @@ No throughput regression observed. TPOT remains stable at 35-37 ms (single user)
 
 - **Warmup**: Each benchmark runs 1 warmup request before the main run to trigger XLA compilation
 - **Metrics**: `vllm bench serve` reports both average and peak throughput; summary table uses median TTFT/TPOT for consistency
-- **Dataset**: Random tokens (`--dataset-name random`) with fixed input/output lengths (`--random-range-ratio 0.0`)
+- **Dataset (Round 5)**: Random tokens (`--dataset-name random`) with fixed input/output lengths
+- **Dataset (Long Text)**: Shakespeare sonnets (`--dataset-name sonnet`, `/workspace/vllm/benchmarks/sonnet.txt`, 517 lines) repeated to fill desired input length via `--sonnet-input-len`
 - **Endpoint**: `/v1/completions` (raw prompt, no chat template overhead)
 - **EOS handling**: `--ignore-eos` forces full output length generation for consistent measurements
