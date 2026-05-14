@@ -1,20 +1,21 @@
 # Gemma4-31B Inference Benchmark on TPU v7xe
 
-Benchmark results for **Gemma4-31B-IT** running on **TPU v7xe (tpu7x-standard-4t, 4 chips / 8 devices)** via vLLM with the experimental Batched RPA kernel.
+Benchmark results for **Gemma4-31B-IT** on **TPU v7xe-8** (4 chips, 8 devices, 768 GB HBM) via vLLM with the experimental Batched RPA kernel. Full 128K context window is supported after applying a [one-line kernel fix](#kernel-fix-full-128k-context-support).
+
+> **Key results**: Peak output throughput **6,144 tok/s** (P=256) · Single-user TPOT **35 ms** · Full 128K context TTFT **378 ms** · Real text = random tokens (no performance difference)
 
 ## Environment
 
-| Component | Version / Config |
-|-----------|-----------------|
-| Model | `google/gemma-4-31b-it` (BF16) |
-| Hardware | TPU v7xe-8 (4 chips, 768 GB HBM total) |
+| Component | Config |
+|-----------|--------|
+| Model | `google/gemma-4-31b-it` (BF16 weights) |
+| Hardware | TPU v7xe-8 (tpu7x-standard-4t, 4 chips, 768 GB HBM) |
 | Framework | vLLM nightly (dev223) + tpu-inference (main) |
-| Kernel | Batched RPA (`USE_BATCHED_RPA_KERNEL=1`) |
+| Attention Kernel | Batched RPA (`USE_BATCHED_RPA_KERNEL=1`) with [prefill_batch_size fix](#kernel-fix-full-128k-context-support) |
 | KV Cache | FP8 (`--kv-cache-dtype fp8`) |
 | Tensor Parallel | 4 (`--tensor-parallel-size 4`) |
-| Max Context | 131072 (`--max-model-len 131072`) |
-| Chunked Prefill | Enabled (`--enable-chunked-prefill --max-num-batched-tokens 16384`) |
-| GPU Memory Util | 0.95 (`--gpu-memory-utilization 0.95`) |
+| Max Context | 131072 tokens (`--max-model-len 131072`) |
+| Chunked Prefill | 16K chunks (`--enable-chunked-prefill --max-num-batched-tokens 16384`) |
 
 ### Launch Command
 
@@ -33,254 +34,126 @@ vllm serve google/gemma-4-31b-it \
     --kv-cache-dtype fp8
 ```
 
-## Benchmark Results (Round 5 — 2026-05-14)
+## Benchmark Results
 
-All benchmarks use `vllm bench serve` with `--dataset-name random --ignore-eos --num-warmups 1`.
+All benchmarks run on 2026-05-14. Each test uses `vllm bench serve` with `--ignore-eos --num-warmups 1`.
 
-### Summary Table
+### Throughput & Latency (Random Tokens)
 
-| Test | Input | Output | Concurrency | Peak tok/s | Median TTFT | Median TPOT | Status |
-|------|-------|--------|-------------|-----------|-------------|-------------|--------|
-| B1: Single User | 1K | 1K | 1 | 29 | 86 ms | 35 ms | PASS |
-| B3: High Throughput | 1K | 1K | 256 | 6,144 | 7,756 ms | 49 ms | PASS |
-| B4: Long Input | 16K | 1K | 16 | 432 | 7,014 ms | 43 ms | PASS |
-| B5: Long Output | 1K | 16K | 4 | 116 | 142 ms | 36 ms | PASS |
-| B6: 64K Context | 64K | 1K | 1 | 29 | 196 ms | 37 ms | PASS |
-| B7: 128K Context | 128K | 1K | 1 | 28 | 421 ms | 37 ms | PASS |
+Dataset: `--dataset-name random` with fixed input/output lengths.
 
-### Detailed Results
+| # | Scenario | Input | Output | Concurrency | Output tok/s | Peak tok/s | TTFT | TPOT |
+|---|----------|-------|--------|-------------|-------------|-----------|------|------|
+| 1 | Single user | 1K | 1K | 1 | 28 | 29 | 86 ms | 35 ms |
+| 2 | High throughput | 1K | 1K | 256 | 4,495 | 6,144 | 7,756 ms* | 49 ms |
+| 3 | Long input | 16K | 1K | 16 | 317 | 432 | 7,014 ms* | 43 ms |
+| 4 | Long output | 1K | 16K | 4 | 110 | 116 | 142 ms | 36 ms |
+| 5 | 64K context | 64K | 1K | 1 | 27 | 29 | 196 ms | 37 ms |
+| 6 | 128K context | 128K | 1K | 1 | 27 | 28 | 421 ms | 37 ms |
 
-#### B1 — Single User Latency (1K/1K)
+\* TTFT includes **queueing time** — with high concurrency, each request waits for earlier prefills to complete. Single-user TTFT (tests 1, 5, 6) reflects pure prefill computation.
 
-```
+### Long Context Scaling (Real Text — Sonnet Dataset)
+
+Dataset: Shakespeare sonnets (`--dataset-name sonnet`), real English text repeated to fill desired input length. Tests whether natural language tokenization or attention patterns affect performance vs random tokens.
+
+| # | Input Length | Concurrency | Output tok/s | Peak tok/s | TTFT | TPOT |
+|---|-------------|-------------|-------------|-----------|------|------|
+| 7 | 64K | 1 | 27.49 | 29 | 231 ms | 36 ms |
+| 8 | 96K | 1 | 26.74 | 28 | 302 ms | 37 ms |
+| 9 | 120K | 1 | 27.39 | 29 | 373 ms | 36 ms |
+| 10 | 128K | 1 | 27.98 | 29 | 378 ms | 35 ms |
+| 11 | 128K | 2 | 44.98 | 58 | 4,714 ms* | 40 ms |
+| 12 | 64K | 4 | 82.99 | 112 | 6,052 ms* | 42 ms |
+
+All tests output 1K tokens. \* TTFT includes queueing time.
+
+### Analysis
+
+**Decode latency (TPOT)** is remarkably stable: 35-42 ms across all scenarios regardless of input length (1K→128K) or concurrency (1→256). This confirms that decode performance is independent of context length once KV cache is populated.
+
+**Prefill latency (TTFT)** scales linearly with input length in single-user mode: 86 ms (1K) → 196 ms (64K) → 421 ms (128K). With chunked prefill enabled (16K chunks), a 128K input is processed in ~8 chunks. Under concurrency, TTFT includes queueing delay as requests wait for prefill scheduling.
+
+**Throughput scaling** is near-linear with concurrency:
+- 1→4 users (64K): 27 → 83 output tok/s (3.1x)
+- 1→2 users (128K): 28 → 45 output tok/s (1.6x)
+- Peak at P=256 (1K): **6,144 output tok/s**
+
+**Real text vs random tokens**: Tests 5-6 (random, 64K/128K) vs tests 7, 10 (sonnet, 64K/128K) show near-identical TPOT (35-37 ms) and throughput (27-28 tok/s), confirming the attention kernel performs consistently with natural language.
+
+### Detailed Commands
+
+<details>
+<summary>Random token benchmarks (tests 1-6)</summary>
+
+```bash
+# Test 1: Single user
 vllm bench serve --dataset-name random \
     --random-input-len 1024 --random-output-len 1024 \
     --num-prompts 1 --max-concurrency 1 --num-warmups 1 --ignore-eos
-```
 
-| Metric | Value |
-|--------|-------|
-| Output tok/s | 28.15 |
-| Peak tok/s | 29.00 |
-| Median TTFT | 86 ms |
-| Median TPOT | 35 ms |
-
-#### B3 — High Throughput (1K/1K, P=256)
-
-```
+# Test 2: High throughput
 vllm bench serve --dataset-name random \
     --random-input-len 1024 --random-output-len 1024 \
     --num-prompts 256 --max-concurrency 256 --num-warmups 1 --ignore-eos
-```
 
-| Metric | Value |
-|--------|-------|
-| Output tok/s | 4,495 |
-| Peak tok/s | 6,144 |
-| Total tok/s | 8,990 |
-| Median TTFT | 7,756 ms |
-| Median TPOT | 49 ms |
-
-#### B4 — Long Input (16K/1K, P=16)
-
-```
+# Test 3: Long input
 vllm bench serve --dataset-name random \
     --random-input-len 16384 --random-output-len 1024 \
     --num-prompts 16 --max-concurrency 16 --num-warmups 1 --ignore-eos
-```
 
-| Metric | Value |
-|--------|-------|
-| Output tok/s | 317 |
-| Peak tok/s | 432 |
-| Total tok/s | 5,397 |
-| Median TTFT | 7,014 ms |
-| Median TPOT | 43 ms |
-
-#### B5 — Long Output (1K/16K, P=4)
-
-```
+# Test 4: Long output
 vllm bench serve --dataset-name random \
     --random-input-len 1024 --random-output-len 16384 \
     --num-prompts 4 --max-concurrency 4 --num-warmups 1 --ignore-eos
-```
 
-| Metric | Value |
-|--------|-------|
-| Output tok/s | 110 |
-| Peak tok/s | 116 |
-| Median TTFT | 142 ms |
-| Median TPOT | 36 ms |
-
-#### B6 — 64K Context (64K/1K, Single User)
-
-Previously crashed with E0200 (before the kernel fix). Now stable.
-
-```
+# Test 5: 64K context
 vllm bench serve --dataset-name random \
     --random-input-len 63488 --random-output-len 1024 \
     --num-prompts 1 --max-concurrency 1 --num-warmups 1 --ignore-eos
-```
 
-| Metric | Value |
-|--------|-------|
-| Output tok/s | 27 |
-| Peak tok/s | 29 |
-| Median TTFT | 196 ms |
-| Median TPOT | 37 ms |
-
-#### B7 — 128K Context (128K/1K, Single User)
-
-Full 128K context window. Previously impossible (crash at >32K). Enabled by the kernel fix below.
-
-```
+# Test 6: 128K context
 vllm bench serve --dataset-name random \
     --random-input-len 130048 --random-output-len 1024 \
     --num-prompts 1 --max-concurrency 1 --num-warmups 1 --ignore-eos
 ```
 
-| Metric | Value |
-|--------|-------|
-| Output tok/s | 27 |
-| Peak tok/s | 28 |
-| Median TTFT | 421 ms |
-| Median TPOT | 37 ms |
+</details>
 
-## Long Text Benchmark (Sonnet Dataset — 2026-05-14)
+<details>
+<summary>Sonnet benchmarks (tests 7-12)</summary>
 
-Real English text benchmark using Shakespeare sonnets (`--dataset-name sonnet`). Unlike random tokens, sonnet tests realistic tokenization patterns and attention behavior with natural language at extreme context lengths.
-
-### Summary Table
-
-| Test | Input | Concurrency | Output tok/s | Peak tok/s | Median TTFT | Median TPOT | Status |
-|------|-------|-------------|-------------|-----------|-------------|-------------|--------|
-| L1: 64K Single | 64K | 1 | 27.49 | 29 | 231 ms | 36 ms | PASS |
-| L2: 96K Single | 96K | 1 | 26.74 | 28 | 302 ms | 37 ms | PASS |
-| L3: 120K Single | 120K | 1 | 27.39 | 29 | 373 ms | 36 ms | PASS |
-| L4: 128K Single | 128K | 1 | 27.98 | 29 | 378 ms | 35 ms | PASS |
-| L5: 128K Dual | 128K | 2 | 44.98 | 58 | 4,714 ms | 40 ms | PASS |
-| L6: 64K Quad | 64K | 4 | 82.99 | 112 | 6,052 ms | 42 ms | PASS |
-
-### Key Findings
-
-- **TPOT stability**: 35-42 ms across all input lengths (64K-128K), confirming decode performance is independent of context length
-- **TTFT scales linearly**: 231 ms (64K) → 378 ms (128K), consistent with chunked prefill processing (~8 chunks for 128K)
-- **Concurrent 128K works**: Two simultaneous 128K requests (L5) complete successfully with near-linear throughput scaling (28→45 tok/s)
-- **Real text ≈ random tokens**: No significant performance difference vs random token benchmarks (Round 5 B6/B7), indicating stable attention kernel behavior with natural language
-
-### Detailed Results
-
-#### L1 — 64K Single User (Sonnet)
-
-```
+```bash
+# Tests 7-10: Single user at 64K/96K/120K/128K
 vllm bench serve --dataset-name sonnet \
     --dataset-path /workspace/vllm/benchmarks/sonnet.txt \
-    --sonnet-input-len 63488 --sonnet-output-len 1024 \
+    --sonnet-input-len <63488|98304|122880|130048> --sonnet-output-len 1024 \
     --num-prompts 1 --max-concurrency 1 --num-warmups 1 --ignore-eos
-```
 
-| Metric | Value |
-|--------|-------|
-| Output tok/s | 27.49 |
-| Peak tok/s | 29 |
-| Median TTFT | 231 ms |
-| Median TPOT | 36 ms |
-
-#### L2 — 96K Single User (Sonnet)
-
-```
-vllm bench serve --dataset-name sonnet \
-    --dataset-path /workspace/vllm/benchmarks/sonnet.txt \
-    --sonnet-input-len 98304 --sonnet-output-len 1024 \
-    --num-prompts 1 --max-concurrency 1 --num-warmups 1 --ignore-eos
-```
-
-| Metric | Value |
-|--------|-------|
-| Output tok/s | 26.74 |
-| Peak tok/s | 28 |
-| Median TTFT | 302 ms |
-| Median TPOT | 37 ms |
-
-#### L3 — 120K Single User (Sonnet)
-
-```
-vllm bench serve --dataset-name sonnet \
-    --dataset-path /workspace/vllm/benchmarks/sonnet.txt \
-    --sonnet-input-len 122880 --sonnet-output-len 1024 \
-    --num-prompts 1 --max-concurrency 1 --num-warmups 1 --ignore-eos
-```
-
-| Metric | Value |
-|--------|-------|
-| Output tok/s | 27.39 |
-| Peak tok/s | 29 |
-| Median TTFT | 373 ms |
-| Median TPOT | 36 ms |
-
-#### L4 — 128K Single User (Sonnet)
-
-Full context window with real text.
-
-```
-vllm bench serve --dataset-name sonnet \
-    --dataset-path /workspace/vllm/benchmarks/sonnet.txt \
-    --sonnet-input-len 130048 --sonnet-output-len 1024 \
-    --num-prompts 1 --max-concurrency 1 --num-warmups 1 --ignore-eos
-```
-
-| Metric | Value |
-|--------|-------|
-| Output tok/s | 27.98 |
-| Peak tok/s | 29 |
-| Median TTFT | 378 ms |
-| Median TPOT | 35 ms |
-
-#### L5 — 128K Dual Concurrent (Sonnet)
-
-Two simultaneous 128K requests — tests memory pressure under concurrent full-context workloads.
-
-```
+# Test 11: 128K dual concurrent
 vllm bench serve --dataset-name sonnet \
     --dataset-path /workspace/vllm/benchmarks/sonnet.txt \
     --sonnet-input-len 130048 --sonnet-output-len 1024 \
     --num-prompts 2 --max-concurrency 2 --num-warmups 1 --ignore-eos
-```
 
-| Metric | Value |
-|--------|-------|
-| Output tok/s | 44.98 |
-| Peak tok/s | 58 |
-| Median TTFT | 4,714 ms |
-| Median TPOT | 40 ms |
-
-#### L6 — 64K Quad Concurrent (Sonnet)
-
-Four simultaneous 64K requests — tests throughput scaling at moderate context length.
-
-```
+# Test 12: 64K quad concurrent
 vllm bench serve --dataset-name sonnet \
     --dataset-path /workspace/vllm/benchmarks/sonnet.txt \
     --sonnet-input-len 63488 --sonnet-output-len 1024 \
     --num-prompts 4 --max-concurrency 4 --num-warmups 1 --ignore-eos
 ```
 
-| Metric | Value |
-|--------|-------|
-| Output tok/s | 82.99 |
-| Peak tok/s | 112 |
-| Median TTFT | 6,052 ms |
-| Median TPOT | 42 ms |
+</details>
 
 ## Kernel Fix: Full 128K Context Support
 
 ### Problem
 
-With the default Batched RPA kernel, Gemma4-31B crashes with `E0200 RuntimeUnexpectedCoreHalt` when context exceeds ~32K tokens (or ~80K with chunked prefill enabled). The crash occurs in the MIXED mode attention kernel (`RPAm-p256-b2-q256-k256`).
+Gemma4-31B crashes with `E0200 RuntimeUnexpectedCoreHalt` when context exceeds ~32K tokens (or ~80K with chunked prefill). The crash occurs in the MIXED mode attention kernel (`RPAm-p256-b2-q256-k256`).
 
 ### Root Cause
 
-`calculate_vmem_usage()` in `wrapper.py` only accounts for pipeline buffers (Q/KV/O arrays) but omits scratch arrays (`m`, `l`, `acc` from `lm_scratch_shape` and `acc_scratch_shape`). With `prefill_batch_size=2`, the untracked scratch memory (~24 MB) pushes total VMEM usage to ~93% of the 64 MB v7x VMEM capacity, causing non-deterministic overflow crashes.
+`calculate_vmem_usage()` in `wrapper.py` only accounts for pipeline buffers (Q/KV/O arrays) but omits scratch arrays (`m`, `l`, `acc`). With `prefill_batch_size=2`, the untracked scratch memory (~24 MB) pushes total VMEM to ~93% of v7x's 64 MB capacity, causing non-deterministic overflow at longer contexts.
 
 ### Fix
 
@@ -291,29 +164,22 @@ One-line change in `tpu_inference/kernels/experimental/batched_rpa/wrapper.py`, 
 +    prefill_batch_size = 1
 ```
 
-This halves MIXED mode scratch memory usage (~24 MB → ~12 MB), keeping total VMEM at ~75% and eliminating overflow.
+This halves MIXED mode scratch memory (~24 MB → ~12 MB), keeping total VMEM at ~75%.
 
 ### Validation
 
-| Context Length | Before Fix (batch=2) | After Fix (batch=1) |
-|---------------|---------------------|---------------------|
+| Context Length | Before Fix | After Fix |
+|---------------|-----------|-----------|
 | ≤ 32K | PASS | PASS |
 | 64K | CRASH (E0200) | PASS |
-| 95K | CRASH | PASS |
-| 119K | CRASH | PASS |
-| 125K | CRASH | PASS |
-| 128K (full) | CRASH | PASS |
-| 131K (max_model_len) | CRASH | PASS |
+| 128K (full context) | CRASH | PASS |
 
-### Performance Impact
-
-No throughput regression observed. TPOT remains stable at 35-37 ms (single user) across all context lengths. The fix only affects MIXED mode (chunked prefill + decode), not pure DECODE mode which handles the majority of token generation.
+No throughput regression: TPOT remains 35-37 ms (single user) at all context lengths. The fix only affects MIXED mode (chunked prefill + decode), not pure DECODE mode.
 
 ## Methodology
 
-- **Warmup**: Each benchmark runs 1 warmup request before the main run to trigger XLA compilation
-- **Metrics**: `vllm bench serve` reports both average and peak throughput; summary table uses median TTFT/TPOT for consistency
-- **Dataset (Round 5)**: Random tokens (`--dataset-name random`) with fixed input/output lengths
-- **Dataset (Long Text)**: Shakespeare sonnets (`--dataset-name sonnet`, `/workspace/vllm/benchmarks/sonnet.txt`, 517 lines) repeated to fill desired input length via `--sonnet-input-len`
+- **Warmup**: 1 warmup request per test to trigger XLA compilation before measurement
+- **Metrics**: Median TTFT and TPOT reported for consistency; peak throughput reflects maximum instantaneous output rate
 - **Endpoint**: `/v1/completions` (raw prompt, no chat template overhead)
-- **EOS handling**: `--ignore-eos` forces full output length generation for consistent measurements
+- **EOS handling**: `--ignore-eos` forces full output length generation for reproducible measurements
+- **Datasets**: Random tokens test raw compute throughput; sonnet (517 lines of Shakespeare, repeated to fill length) tests real-text behavior
